@@ -2,127 +2,205 @@
 declare(strict_types=1);
 error_reporting(E_ALL & ~E_NOTICE);
 ini_set('display_errors', '0');
+ini_set('log_errors', '1');
+
+// Cria diretórios necessários
+$logsDir = __DIR__ . '/logs';
+$cacheDir = __DIR__ . '/cache';
+$sitesDir = __DIR__ . '/sites';
+
+foreach ([$logsDir, $cacheDir, $sitesDir] as $dir) {
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0755, true);
+    }
+}
+
+ini_set('error_log', $logsDir . '/errors.log');
 
 // Segurança básica
 header('X-Content-Type-Options: nosniff');
-header('Referrer-Policy: strict-origin-when-cross-origin');
 header('X-Frame-Options: SAMEORIGIN');
+header('X-XSS-Protection: 1; mode=block');
+header('Referrer-Policy: strict-origin-when-cross-origin');
+header('Permissions-Policy: geolocation=(), microphone=(), camera=()');
+header("Content-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https:; script-src 'self' 'unsafe-inline' https://www.googletagmanager.com https://www.google-analytics.com; connect-src 'self' https://www.google-analytics.com");
 
-function e($s){ return htmlspecialchars((string)$s, ENT_QUOTES|ENT_SUBSTITUTE, 'UTF-8'); }
+function e($s): string { 
+    return htmlspecialchars((string)$s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); 
+}
 
-// === Classe do GERADOR por CNPJ (injetada) ===
-class GeradorSiteGoogleAds {
-    private $cnpj;
-    private $dadosEmpresa;
-    private $coresNicho;
+// Rate limiting simples para geração
+function check_generation_rate_limit(): bool {
+    $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+    $key = 'gen_' . md5($ip);
+    $file = sys_get_temp_dir() . '/' . $key . '.json';
     
-    public function __construct($cnpj) {
-        $this->cnpj = $this->limparCNPJ($cnpj);
-        $this->definirCoresNicho();
+    $data = ['count' => 0, 'reset' => time() + 3600];
+    if (is_file($file)) {
+        $content = @file_get_contents($file);
+        if ($content) {
+            $data = json_decode($content, true) ?: $data;
+        }
     }
     
-    private function limparCNPJ($cnpj) {
+    if (time() > $data['reset']) {
+        $data = ['count' => 0, 'reset' => time() + 3600];
+    }
+    
+    if ($data['count'] >= 10) {
+        return false;
+    }
+    
+    $data['count']++;
+    file_put_contents($file, json_encode($data));
+    return true;
+}
+
+// === CLASSE DO GERADOR COMPLETA ===
+class GeradorSiteGoogleAds {
+    private string $cnpj;
+    private array $dadosEmpresa = [];
+    private array $coresNicho;
+    private const API_TIMEOUT = 30;
+    private const CACHE_DIR = __DIR__ . '/cache';
+    
+    public function __construct(string $cnpj) {
+        $this->cnpj = $this->limparCNPJ($cnpj);
+        $this->definirCoresNicho();
+        
+        if (!is_dir(self::CACHE_DIR)) {
+            @mkdir(self::CACHE_DIR, 0755, true);
+        }
+    }
+    
+    private function limparCNPJ(string $cnpj): string {
         return preg_replace('/[^0-9]/', '', $cnpj);
     }
     
-    private function obterValor($array, $chave, $padrao = '') {
-        return isset($array[$chave]) ? $array[$chave] : $padrao;
+    private function obterValor(array $array, string $chave, $padrao = '') {
+        return $array[$chave] ?? $padrao;
     }
     
-    public function buscarDadosAPI() {
+    public function buscarDadosAPI(): array {
+        if (strlen($this->cnpj) !== 14) {
+            throw new Exception("CNPJ deve ter 14 dígitos");
+        }
+        
+        $cacheFile = self::CACHE_DIR . '/' . $this->cnpj . '.json';
+        if (is_file($cacheFile) && (time() - filemtime($cacheFile)) < 86400) {
+            $cached = @file_get_contents($cacheFile);
+            if ($cached) {
+                $this->dadosEmpresa = json_decode($cached, true) ?: [];
+                if (!empty($this->dadosEmpresa)) {
+                    return $this->dadosEmpresa;
+                }
+            }
+        }
+        
         $url = "https://minhareceita.org/{$this->cnpj}";
         
         $ch = curl_init();
-        curl_setopt($ch, CURLOPT_URL, $url);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 20);
-        curl_setopt($ch, CURLOPT_USERAGENT, 'GeradorSiteGoogleAds/3.1');
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+        curl_setopt_array($ch, [
+            CURLOPT_URL => $url,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_TIMEOUT => self::API_TIMEOUT,
+            CURLOPT_USERAGENT => 'Mozilla/5.0 (compatible; GeradorSite/4.0)',
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS => 3,
+            CURLOPT_ENCODING => 'gzip, deflate'
+        ]);
         
         $response = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $error = curl_error($ch);
         curl_close($ch);
         
-        if ($httpCode != 200) {
-            throw new Exception("Erro ao buscar dados da API. Código: " . $httpCode);
+        if ($httpCode !== 200) {
+            throw new Exception("Erro ao buscar dados da API. Código HTTP: {$httpCode}");
+        }
+        
+        if ($error) {
+            throw new Exception("Erro cURL: {$error}");
         }
         
         $this->dadosEmpresa = json_decode($response, true);
         
-        if (!$this->dadosEmpresa) {
-            throw new Exception("Erro ao decodificar resposta da API");
+        if (!is_array($this->dadosEmpresa) || empty($this->dadosEmpresa)) {
+            throw new Exception("Resposta inválida da API ou CNPJ não encontrado");
         }
         
+        @file_put_contents($cacheFile, $response);
         return $this->dadosEmpresa;
     }
     
-    private function definirCoresNicho() {
-        $this->coresNicho = array(
-            'tecnologia' => array(
+    private function definirCoresNicho(): void {
+        $this->coresNicho = [
+            'tecnologia' => [
                 'primaria' => '#6366f1',
                 'secundaria' => '#4f46e5',
                 'acento' => '#8b5cf6',
                 'gradiente' => 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
                 'icone' => '💻'
-            ),
-            'saude' => array(
+            ],
+            'saude' => [
                 'primaria' => '#10b981',
                 'secundaria' => '#059669',
                 'acento' => '#34d399',
                 'gradiente' => 'linear-gradient(135deg, #0ba360 0%, #3cba92 100%)',
                 'icone' => '🏥'
-            ),
-            'comercio' => array(
+            ],
+            'comercio' => [
                 'primaria' => '#f59e0b',
                 'secundaria' => '#d97706',
                 'acento' => '#fbbf24',
                 'gradiente' => 'linear-gradient(135deg, #f093fb 0%, #f5576c 100%)',
                 'icone' => '🛒'
-            ),
-            'servicos' => array(
+            ],
+            'servicos' => [
                 'primaria' => '#06b6d4',
                 'secundaria' => '#0891b2',
                 'acento' => '#22d3ee',
                 'gradiente' => 'linear-gradient(135deg, #4facfe 0%, #00f2fe 100%)',
                 'icone' => '🔧'
-            ),
-            'industria' => array(
+            ],
+            'industria' => [
                 'primaria' => '#64748b',
                 'secundaria' => '#475569',
                 'acento' => '#94a3b8',
                 'gradiente' => 'linear-gradient(135deg, #434343 0%, #000000 100%)',
                 'icone' => '🏭'
-            ),
-            'educacao' => array(
+            ],
+            'educacao' => [
                 'primaria' => '#8b5cf6',
                 'secundaria' => '#7c3aed',
                 'acento' => '#a78bfa',
                 'gradiente' => 'linear-gradient(135deg, #a8edea 0%, #fed6e3 100%)',
                 'icone' => '📚'
-            ),
-            'default' => array(
+            ],
+            'default' => [
                 'primaria' => '#3b82f6',
                 'secundaria' => '#2563eb',
                 'acento' => '#60a5fa',
                 'gradiente' => 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
                 'icone' => '🏢'
-            )
-        );
+            ]
+        ];
     }
     
-    private function identificarNicho() {
+    private function identificarNicho(): string {
         $cnae = strtolower($this->obterValor($this->dadosEmpresa, 'cnae_fiscal_descricao', ''));
         
-        $nichos = array(
-            'tecnologia' => array('software', 'tecnologia', 'informática', 'internet', 'desenvolvimento', 'programação', 'sistemas', 'web', 'aplicativos'),
-            'saude' => array('saúde', 'médica', 'médico', 'hospital', 'clínica', 'farmácia', 'laboratório', 'odontológica', 'fisioterapia'),
-            'comercio' => array('comércio', 'varejo', 'loja', 'venda', 'mercado', 'supermercado', 'magazine'),
-            'servicos' => array('serviços', 'consultoria', 'assessoria', 'manutenção', 'limpeza', 'segurança'),
-            'industria' => array('indústria', 'fabricação', 'manufatura', 'produção', 'industrial'),
-            'educacao' => array('educação', 'ensino', 'escola', 'curso', 'treinamento', 'capacitação')
-        );
+        $nichos = [
+            'tecnologia' => ['software', 'tecnologia', 'informática', 'internet', 'desenvolvimento', 'programação', 'sistemas', 'web', 'aplicativos', 'digital'],
+            'saude' => ['saúde', 'médica', 'médico', 'hospital', 'clínica', 'farmácia', 'laboratório', 'odontológica', 'fisioterapia', 'enfermagem'],
+            'comercio' => ['comércio', 'varejo', 'loja', 'venda', 'mercado', 'supermercado', 'magazine', 'atacado'],
+            'servicos' => ['serviços', 'consultoria', 'assessoria', 'manutenção', 'limpeza', 'segurança', 'advocacia'],
+            'industria' => ['indústria', 'fabricação', 'manufatura', 'produção', 'industrial', 'fábrica'],
+            'educacao' => ['educação', 'ensino', 'escola', 'curso', 'treinamento', 'capacitação', 'faculdade']
+        ];
         
         foreach ($nichos as $nicho => $palavras) {
             foreach ($palavras as $palavra) {
@@ -135,21 +213,20 @@ class GeradorSiteGoogleAds {
         return 'default';
     }
     
-    private function getCores() {
+    private function getCores(): array {
         $nicho = $this->identificarNicho();
         return $this->coresNicho[$nicho];
     }
     
-    private function gerarNomeFantasia() {
+    private function gerarNomeFantasia(): string {
         $nomeFantasia = $this->obterValor($this->dadosEmpresa, 'nome_fantasia', '');
-        if (!empty($nomeFantasia)) {
+        if (!empty($nomeFantasia) && $nomeFantasia !== '********') {
             return $nomeFantasia;
         }
-        $razaoSocial = $this->obterValor($this->dadosEmpresa, 'razao_social', 'Empresa');
-        return $razaoSocial;
+        return $this->obterValor($this->dadosEmpresa, 'razao_social', 'Empresa');
     }
     
-    private function gerarSchemaOrg() {
+    private function gerarSchemaOrg(): string {
         $nomeFantasia = $this->gerarNomeFantasia();
         $razaoSocial = $this->obterValor($this->dadosEmpresa, 'razao_social', '');
         $cnae = $this->obterValor($this->dadosEmpresa, 'cnae_fiscal_descricao', '');
@@ -163,7 +240,7 @@ class GeradorSiteGoogleAds {
         $uf = $this->obterValor($this->dadosEmpresa, 'uf', '');
         $cep = $this->obterValor($this->dadosEmpresa, 'cep', '');
         
-        $schema = array(
+        $schema = [
             "@context" => "https://schema.org",
             "@type" => "LocalBusiness",
             "name" => $nomeFantasia,
@@ -171,36 +248,54 @@ class GeradorSiteGoogleAds {
             "description" => $cnae,
             "telephone" => $telefone,
             "email" => $email,
-            "address" => array(
+            "address" => [
                 "@type" => "PostalAddress",
-                "streetAddress" => $logradouro . ", " . $numero,
+                "streetAddress" => trim($logradouro . ", " . $numero),
                 "addressLocality" => $municipio,
                 "addressRegion" => $uf,
                 "postalCode" => $cep,
                 "addressCountry" => "BR"
-            ),
-            "geo" => array(
-                "@type" => "GeoCoordinates",
-                "latitude" => "",
-                "longitude" => ""
-            ),
-            "openingHoursSpecification" => array(
+            ],
+            "openingHoursSpecification" => [
                 "@type" => "OpeningHoursSpecification",
-                "dayOfWeek" => array("Monday", "Tuesday", "Wednesday", "Thursday", "Friday"),
+                "dayOfWeek" => ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
                 "opens" => "08:00",
                 "closes" => "18:00"
-            )
-        );
+            ]
+        ];
         
-        return '<script type="application/ld+json">' . json_encode($schema, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT) . '</script>';
+        return '<script type="application/ld+json">' . 
+               json_encode($schema, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT) . 
+               '</script>';
     }
     
-    public function gerarCSS() {
+    public function gerarCSS(): string {
         $cores = $this->getCores();
         
-        $css = "
+        return "
         <style>
-            @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700;800&display=swap');
+            @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+            
+            :root {
+                --cor-primaria: {$cores['primaria']};
+                --cor-secundaria: {$cores['secundaria']};
+                --cor-acento: {$cores['acento']};
+                --gradiente: {$cores['gradiente']};
+                --bg-light: #ffffff;
+                --bg-section: #f8fafc;
+                --text-primary: #0f172a;
+                --text-secondary: #64748b;
+                --border-color: #e2e8f0;
+                --shadow-sm: 0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.08);
+                --shadow-md: 0 4px 6px rgba(0,0,0,0.07), 0 2px 4px rgba(0,0,0,0.06);
+                --shadow-lg: 0 10px 15px rgba(0,0,0,0.1), 0 4px 6px rgba(0,0,0,0.09);
+                --shadow-xl: 0 20px 25px rgba(0,0,0,0.15), 0 10px 10px rgba(0,0,0,0.04);
+                --radius-sm: 8px;
+                --radius-md: 12px;
+                --radius-lg: 16px;
+                --radius-xl: 20px;
+                --transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            }
             
             * {
                 margin: 0;
@@ -208,52 +303,57 @@ class GeradorSiteGoogleAds {
                 box-sizing: border-box;
             }
             
-            :root {
-                --cor-primaria: " . $cores['primaria'] . ";
-                --cor-secundaria: " . $cores['secundaria'] . ";
-                --cor-acento: " . $cores['acento'] . ";
-                --gradiente: " . $cores['gradiente'] . ";
-            }
-            
             html {
                 scroll-behavior: smooth;
+                -webkit-font-smoothing: antialiased;
+                -moz-osx-font-smoothing: grayscale;
             }
             
             body {
-                font-family: 'Poppins', sans-serif;
+                font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
                 line-height: 1.6;
-                color: #333;
+                color: var(--text-primary);
                 overflow-x: hidden;
+                background: var(--bg-light);
             }
             
             img {
                 max-width: 100%;
                 height: auto;
-                loading: lazy;
+                display: block;
             }
             
+            /* Container */
             .container {
                 max-width: 1200px;
                 margin: 0 auto;
                 padding: 0 20px;
             }
             
+            @media (min-width: 768px) {
+                .container {
+                    padding: 0 40px;
+                }
+            }
+            
+            /* Header */
             header {
-                background: rgba(255, 255, 255, 0.98);
-                backdrop-filter: blur(10px);
+                background: rgba(255, 255, 255, 0.95);
+                backdrop-filter: blur(20px) saturate(180%);
+                -webkit-backdrop-filter: blur(20px) saturate(180%);
                 padding: 1rem 0;
-                box-shadow: 0 2px 20px rgba(0,0,0,0.1);
+                box-shadow: var(--shadow-sm);
                 position: fixed;
                 top: 0;
                 left: 0;
                 right: 0;
                 z-index: 1000;
-                transition: all 0.3s;
+                transition: var(--transition);
             }
             
             header.scrolled {
-                padding: 0.5rem 0;
-                box-shadow: 0 2px 30px rgba(0,0,0,0.15);
+                padding: 0.75rem 0;
+                box-shadow: var(--shadow-md);
             }
             
             header .container {
@@ -263,38 +363,45 @@ class GeradorSiteGoogleAds {
             }
             
             .logo {
-                font-size: 1.8rem;
+                font-size: clamp(1.5rem, 4vw, 1.875rem);
                 font-weight: 800;
                 background: var(--gradiente);
                 -webkit-background-clip: text;
                 -webkit-text-fill-color: transparent;
                 background-clip: text;
+                letter-spacing: -0.02em;
             }
             
             nav ul {
                 list-style: none;
                 display: flex;
-                gap: 2.5rem;
+                gap: clamp(1.5rem, 3vw, 2.5rem);
                 align-items: center;
             }
             
             nav a {
-                color: #333;
+                color: var(--text-primary);
                 text-decoration: none;
                 font-weight: 500;
-                transition: all 0.3s;
+                font-size: 0.9375rem;
+                transition: var(--transition);
                 position: relative;
+                padding: 0.5rem 0;
             }
             
             nav a::after {
                 content: '';
                 position: absolute;
-                bottom: -5px;
+                bottom: 0;
                 left: 0;
                 width: 0;
                 height: 2px;
                 background: var(--cor-primaria);
-                transition: width 0.3s;
+                transition: width 0.3s ease;
+            }
+            
+            nav a:hover {
+                color: var(--cor-primaria);
             }
             
             nav a:hover::after {
@@ -306,16 +413,36 @@ class GeradorSiteGoogleAds {
                 flex-direction: column;
                 cursor: pointer;
                 gap: 5px;
+                padding: 8px;
+                border-radius: var(--radius-sm);
+                transition: var(--transition);
+            }
+            
+            .menu-toggle:hover {
+                background: var(--bg-section);
             }
             
             .menu-toggle span {
-                width: 25px;
-                height: 3px;
+                width: 24px;
+                height: 2.5px;
                 background: var(--cor-primaria);
-                border-radius: 3px;
-                transition: all 0.3s;
+                border-radius: 2px;
+                transition: var(--transition);
             }
             
+            .menu-toggle.active span:nth-child(1) {
+                transform: translateY(7.5px) rotate(45deg);
+            }
+            
+            .menu-toggle.active span:nth-child(2) {
+                opacity: 0;
+            }
+            
+            .menu-toggle.active span:nth-child(3) {
+                transform: translateY(-7.5px) rotate(-45deg);
+            }
+            
+            /* Hero Section */
             .hero {
                 background: var(--gradiente);
                 color: white;
@@ -323,6 +450,17 @@ class GeradorSiteGoogleAds {
                 position: relative;
                 overflow: hidden;
                 margin-top: 70px;
+            }
+            
+            .hero::before {
+                content: '';
+                position: absolute;
+                top: 0;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                background: url('data:image/svg+xml,%3Csvg width=\"20\" height=\"20\" xmlns=\"http://www.w3.org/2000/svg\"%3E%3Cpath d=\"M0 0h20v20H0z\" fill=\"none\"/%3E%3Cpath d=\"M0 0h1v1H0zm19 19h1v1h-1z\" fill=\"%23fff\" fill-opacity=\".05\"/%3E%3C/svg%3E');
+                opacity: 0.4;
             }
             
             .hero-content {
@@ -334,16 +472,18 @@ class GeradorSiteGoogleAds {
             }
             
             .hero h1 {
-                font-size: 3.5rem;
+                font-size: clamp(2rem, 6vw, 3.5rem);
                 font-weight: 800;
                 margin-bottom: 1.5rem;
                 line-height: 1.2;
+                letter-spacing: -0.02em;
             }
             
             .hero p {
-                font-size: 1.3rem;
+                font-size: clamp(1.125rem, 2vw, 1.375rem);
                 margin-bottom: 2.5rem;
                 opacity: 0.95;
+                line-height: 1.6;
             }
             
             .hero-buttons {
@@ -354,20 +494,28 @@ class GeradorSiteGoogleAds {
             }
             
             .btn {
-                display: inline-block;
-                padding: 15px 40px;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                padding: 15px 32px;
                 background: white;
                 color: var(--cor-primaria);
                 text-decoration: none;
                 border-radius: 50px;
                 font-weight: 600;
-                transition: all 0.3s;
-                box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+                font-size: 1rem;
+                transition: var(--transition);
+                box-shadow: var(--shadow-lg);
+                border: 2px solid transparent;
             }
             
             .btn:hover {
                 transform: translateY(-3px);
-                box-shadow: 0 15px 40px rgba(0,0,0,0.3);
+                box-shadow: var(--shadow-xl);
+            }
+            
+            .btn:active {
+                transform: translateY(-1px);
             }
             
             .btn-outline {
@@ -381,12 +529,13 @@ class GeradorSiteGoogleAds {
                 color: var(--cor-primaria);
             }
             
+            /* Sections */
             section {
-                padding: 100px 0;
+                padding: clamp(60px, 10vw, 100px) 0;
             }
             
             section h2 {
-                font-size: 2.5rem;
+                font-size: clamp(2rem, 5vw, 2.5rem);
                 font-weight: 700;
                 margin-bottom: 1rem;
                 text-align: center;
@@ -394,55 +543,62 @@ class GeradorSiteGoogleAds {
                 -webkit-background-clip: text;
                 -webkit-text-fill-color: transparent;
                 background-clip: text;
+                letter-spacing: -0.02em;
             }
             
             .section-subtitle {
                 text-align: center;
-                font-size: 1.1rem;
-                color: #666;
+                font-size: clamp(1rem, 2vw, 1.125rem);
+                color: var(--text-secondary);
                 max-width: 700px;
                 margin: 0 auto 4rem;
+                line-height: 1.7;
             }
             
+            /* Stats */
             .stats {
-                background: #f8f9fa;
+                background: var(--bg-section);
             }
             
             .stats-grid {
                 display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+                grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
                 gap: 2rem;
                 text-align: center;
             }
             
             .stat-card {
                 background: white;
-                padding: 2.5rem;
-                border-radius: 20px;
-                box-shadow: 0 5px 20px rgba(0,0,0,0.05);
-                transition: all 0.3s;
+                padding: 2.5rem 1.5rem;
+                border-radius: var(--radius-xl);
+                box-shadow: var(--shadow-sm);
+                transition: var(--transition);
+                border: 1px solid var(--border-color);
             }
             
             .stat-card:hover {
-                transform: translateY(-10px);
-                box-shadow: 0 15px 40px rgba(0,0,0,0.1);
+                transform: translateY(-8px);
+                box-shadow: var(--shadow-lg);
+                border-color: var(--cor-primaria);
             }
             
             .stat-number {
-                font-size: 3rem;
+                font-size: clamp(2.5rem, 5vw, 3rem);
                 font-weight: 800;
                 background: var(--gradiente);
                 -webkit-background-clip: text;
                 -webkit-text-fill-color: transparent;
                 background-clip: text;
+                margin-bottom: 0.5rem;
             }
             
             .stat-label {
-                font-size: 1.1rem;
-                color: #666;
+                font-size: 1.0625rem;
+                color: var(--text-secondary);
                 font-weight: 500;
             }
             
+            /* Cards Grid */
             .cards-grid {
                 display: grid;
                 grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
@@ -453,11 +609,12 @@ class GeradorSiteGoogleAds {
             .card {
                 background: white;
                 padding: 2.5rem;
-                border-radius: 20px;
-                box-shadow: 0 5px 20px rgba(0,0,0,0.08);
-                transition: all 0.3s;
+                border-radius: var(--radius-xl);
+                box-shadow: var(--shadow-sm);
+                transition: var(--transition);
                 position: relative;
                 overflow: hidden;
+                border: 1px solid var(--border-color);
             }
             
             .card::before {
@@ -469,12 +626,14 @@ class GeradorSiteGoogleAds {
                 height: 4px;
                 background: var(--gradiente);
                 transform: scaleX(0);
-                transition: transform 0.3s;
+                transform-origin: left;
+                transition: transform 0.3s ease;
             }
             
             .card:hover {
-                transform: translateY(-10px);
-                box-shadow: 0 15px 40px rgba(0,0,0,0.15);
+                transform: translateY(-8px);
+                box-shadow: var(--shadow-lg);
+                border-color: var(--cor-primaria);
             }
             
             .card:hover::before {
@@ -484,14 +643,22 @@ class GeradorSiteGoogleAds {
             .card-icon {
                 font-size: 3rem;
                 margin-bottom: 1rem;
+                display: inline-block;
             }
             
             .card h3 {
                 color: var(--cor-primaria);
                 margin-bottom: 1rem;
-                font-size: 1.4rem;
+                font-size: 1.375rem;
+                font-weight: 600;
             }
             
+            .card p {
+                color: var(--text-secondary);
+                line-height: 1.7;
+            }
+            
+            /* Servicos Grid */
             .servicos-grid {
                 display: grid;
                 grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
@@ -499,32 +666,48 @@ class GeradorSiteGoogleAds {
             }
             
             .servico-card {
-                background: linear-gradient(135deg, rgba(102, 126, 234, 0.1) 0%, rgba(118, 75, 162, 0.1) 100%);
+                background: linear-gradient(135deg, rgba(99, 102, 241, 0.05) 0%, rgba(139, 92, 246, 0.05) 100%);
                 padding: 2.5rem;
-                border-radius: 20px;
+                border-radius: var(--radius-xl);
                 text-align: center;
-                transition: all 0.3s;
+                transition: var(--transition);
                 border: 2px solid transparent;
             }
             
             .servico-card:hover {
                 border-color: var(--cor-primaria);
-                transform: scale(1.05);
+                transform: scale(1.03);
                 background: white;
-                box-shadow: 0 15px 40px rgba(0,0,0,0.1);
+                box-shadow: var(--shadow-lg);
             }
             
             .servico-icon {
                 font-size: 3.5rem;
                 margin-bottom: 1rem;
+                display: inline-block;
             }
             
+            .servico-card h3 {
+                color: var(--text-primary);
+                margin-bottom: 1rem;
+                font-size: 1.25rem;
+                font-weight: 600;
+            }
+            
+            .servico-card p {
+                color: var(--text-secondary);
+                line-height: 1.7;
+                font-size: 0.9375rem;
+            }
+            
+            /* Empresa Info */
             .empresa-info {
-                background: linear-gradient(135deg, rgba(102, 126, 234, 0.07) 0%, rgba(118, 75, 162, 0.07) 100%);
+                background: linear-gradient(135deg, rgba(99, 102, 241, 0.03) 0%, rgba(139, 92, 246, 0.03) 100%);
                 padding: 3rem;
-                border-radius: 20px;
+                border-radius: var(--radius-xl);
                 margin: 3rem 0;
                 border-left: 5px solid var(--cor-primaria);
+                box-shadow: var(--shadow-sm);
             }
             
             .info-grid {
@@ -555,10 +738,17 @@ class GeradorSiteGoogleAds {
             .info-text strong {
                 display: block;
                 color: var(--cor-primaria);
-                font-size: 0.9rem;
+                font-size: 0.875rem;
                 margin-bottom: 0.3rem;
+                font-weight: 600;
             }
             
+            .info-text span {
+                color: var(--text-secondary);
+                font-size: 0.9375rem;
+            }
+            
+            /* FAQ */
             .faq-container {
                 max-width: 800px;
                 margin: 0 auto;
@@ -567,9 +757,15 @@ class GeradorSiteGoogleAds {
             .faq-item {
                 background: white;
                 margin-bottom: 1rem;
-                border-radius: 15px;
-                box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+                border-radius: var(--radius-lg);
+                box-shadow: var(--shadow-sm);
                 overflow: hidden;
+                border: 1px solid var(--border-color);
+                transition: var(--transition);
+            }
+            
+            .faq-item:hover {
+                box-shadow: var(--shadow-md);
             }
             
             .faq-question {
@@ -579,57 +775,75 @@ class GeradorSiteGoogleAds {
                 justify-content: space-between;
                 align-items: center;
                 font-weight: 600;
-                transition: all 0.3s;
+                transition: var(--transition);
+                user-select: none;
             }
             
             .faq-question:hover {
-                background: #f8f9fa;
+                background: var(--bg-section);
+                color: var(--cor-primaria);
             }
             
             .faq-answer {
                 max-height: 0;
                 overflow: hidden;
-                transition: all 0.3s;
+                transition: max-height 0.3s ease, padding 0.3s ease;
                 padding: 0 1.5rem;
+                color: var(--text-secondary);
+                line-height: 1.7;
             }
             
             .faq-answer.active {
-                max-height: 300px;
+                max-height: 500px;
                 padding: 0 1.5rem 1.5rem;
             }
             
             .faq-icon {
-                transition: transform 0.3s;
+                transition: transform 0.3s ease;
+                font-size: 1.25rem;
             }
             
             .faq-icon.active {
                 transform: rotate(180deg);
             }
             
+            /* Contato */
             .contato-grid {
                 display: grid;
-                grid-template-columns: 1fr 1fr;
+                grid-template-columns: 1fr;
                 gap: 4rem;
                 align-items: start;
+            }
+            
+            @media (min-width: 992px) {
+                .contato-grid {
+                    grid-template-columns: 1fr 1fr;
+                }
             }
             
             .contato-info {
                 background: var(--gradiente);
                 color: white;
                 padding: 3rem;
-                border-radius: 20px;
+                border-radius: var(--radius-xl);
                 height: 100%;
             }
             
             .contato-item {
                 display: flex;
-                align-items: center;
+                align-items: flex-start;
                 gap: 1rem;
                 margin-bottom: 2rem;
                 padding: 1.5rem;
                 background: rgba(255,255,255,0.1);
-                border-radius: 15px;
+                border-radius: var(--radius-lg);
                 backdrop-filter: blur(10px);
+                transition: var(--transition);
+            }
+            
+            .contato-item:hover {
+                background: rgba(255,255,255,0.15);
+                transform: translateX(5px);
             }
             
             .contato-item-icon {
@@ -647,8 +861,9 @@ class GeradorSiteGoogleAds {
             .form-container {
                 background: white;
                 padding: 3rem;
-                border-radius: 20px;
-                box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+                border-radius: var(--radius-xl);
+                box-shadow: var(--shadow-lg);
+                border: 1px solid var(--border-color);
             }
             
             .form-group {
@@ -659,25 +874,27 @@ class GeradorSiteGoogleAds {
                 display: block;
                 margin-bottom: 0.5rem;
                 font-weight: 600;
-                color: #333;
+                color: var(--text-primary);
+                font-size: 0.9375rem;
             }
             
             .form-group input,
             .form-group textarea {
                 width: 100%;
-                padding: 15px;
-                border: 2px solid #e0e0e0;
-                border-radius: 10px;
+                padding: 14px 16px;
+                border: 2px solid var(--border-color);
+                border-radius: var(--radius-md);
                 font-family: inherit;
                 font-size: 1rem;
-                transition: all 0.3s;
+                transition: var(--transition);
+                background: white;
             }
             
             .form-group input:focus,
             .form-group textarea:focus {
                 outline: none;
                 border-color: var(--cor-primaria);
-                box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+                box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
             }
             
             .form-group textarea {
@@ -689,26 +906,33 @@ class GeradorSiteGoogleAds {
                 background: var(--gradiente);
                 color: white;
                 border: none;
-                padding: 15px 40px;
+                padding: 15px 32px;
                 border-radius: 50px;
                 cursor: pointer;
                 font-size: 1rem;
                 font-weight: 600;
-                transition: all 0.3s;
+                transition: var(--transition);
                 width: 100%;
+                box-shadow: var(--shadow-md);
             }
             
             .btn-submit:hover {
                 transform: translateY(-2px);
-                box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+                box-shadow: var(--shadow-lg);
             }
             
+            .btn-submit:active {
+                transform: translateY(0);
+            }
+            
+            /* Mapa */
             .mapa-container {
                 margin: 4rem 0;
-                border-radius: 20px;
+                border-radius: var(--radius-xl);
                 overflow: hidden;
-                box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+                box-shadow: var(--shadow-lg);
                 height: 500px;
+                border: 1px solid var(--border-color);
             }
             
             .mapa-container iframe {
@@ -717,8 +941,9 @@ class GeradorSiteGoogleAds {
                 border: none;
             }
             
+            /* Footer */
             footer {
-                background: #1a202c;
+                background: #0f172a;
                 color: white;
                 padding: 4rem 0 2rem;
             }
@@ -732,7 +957,8 @@ class GeradorSiteGoogleAds {
             
             .footer-section h3 {
                 margin-bottom: 1.5rem;
-                font-size: 1.3rem;
+                font-size: 1.25rem;
+                font-weight: 600;
             }
             
             .footer-section ul {
@@ -744,9 +970,10 @@ class GeradorSiteGoogleAds {
             }
             
             .footer-section a {
-                color: #a0aec0;
+                color: #94a3b8;
                 text-decoration: none;
-                transition: color 0.3s;
+                transition: var(--transition);
+                font-size: 0.9375rem;
             }
             
             .footer-section a:hover {
@@ -754,31 +981,33 @@ class GeradorSiteGoogleAds {
             }
             
             .footer-bottom {
-                border-top: 1px solid #2d3748;
+                border-top: 1px solid #1e293b;
                 padding-top: 2rem;
                 text-align: center;
-                color: #a0aec0;
+                color: #64748b;
             }
             
             .footer-info {
                 background: rgba(255,255,255,0.05);
                 padding: 2rem;
-                border-radius: 15px;
+                border-radius: var(--radius-lg);
                 margin-bottom: 2rem;
             }
             
             .footer-info p {
                 margin: 0.5rem 0;
-                font-size: 0.9rem;
+                font-size: 0.875rem;
+                color: #94a3b8;
             }
             
+            /* WhatsApp Float */
             .whatsapp-float {
                 position: fixed;
                 bottom: 30px;
                 right: 30px;
                 width: 60px;
                 height: 60px;
-                background: #25D366;
+                background: linear-gradient(135deg, #25D366, #128C7E);
                 border-radius: 50%;
                 display: flex;
                 align-items: center;
@@ -788,7 +1017,7 @@ class GeradorSiteGoogleAds {
                 box-shadow: 0 4px 20px rgba(37, 211, 102, 0.4);
                 z-index: 999;
                 cursor: pointer;
-                transition: all 0.3s;
+                transition: var(--transition);
                 text-decoration: none;
             }
             
@@ -797,18 +1026,34 @@ class GeradorSiteGoogleAds {
                 box-shadow: 0 6px 30px rgba(37, 211, 102, 0.6);
             }
             
+            .whatsapp-float:active {
+                transform: scale(1.05);
+            }
+            
+            /* Cookie Banner */
             .cookie-banner {
                 position: fixed;
                 bottom: 0;
                 left: 0;
                 right: 0;
-                background: rgba(26, 32, 44, 0.98);
-                backdrop-filter: blur(10px);
+                background: rgba(15, 23, 42, 0.98);
+                backdrop-filter: blur(20px) saturate(180%);
+                -webkit-backdrop-filter: blur(20px) saturate(180%);
                 color: white;
                 padding: 1.5rem;
                 display: none;
                 z-index: 9999;
                 box-shadow: 0 -5px 30px rgba(0,0,0,0.3);
+                animation: slideUp 0.4s ease;
+            }
+            
+            @keyframes slideUp {
+                from {
+                    transform: translateY(100%);
+                }
+                to {
+                    transform: translateY(0);
+                }
             }
             
             .cookie-banner.show {
@@ -822,49 +1067,47 @@ class GeradorSiteGoogleAds {
                 justify-content: space-between;
                 align-items: center;
                 gap: 2rem;
+                flex-wrap: wrap;
             }
             
             .cookie-text {
                 flex: 1;
+                min-width: 300px;
             }
             
             .cookie-text h4 {
                 margin-bottom: 0.5rem;
-                font-size: 1.2rem;
+                font-size: 1.125rem;
+                font-weight: 600;
             }
             
             .cookie-text p {
-                font-size: 0.9rem;
+                font-size: 0.9375rem;
                 opacity: 0.9;
+                line-height: 1.6;
+            }
+            
+            .cookie-text a {
+                color: var(--cor-acento);
+                text-decoration: underline;
             }
             
             .cookie-buttons {
                 display: flex;
                 gap: 1rem;
                 flex-shrink: 0;
+                flex-wrap: wrap;
             }
             
             .cookie-buttons .btn {
-                padding: 10px 25px;
-                font-size: 0.9rem;
+                padding: 12px 24px;
+                font-size: 0.9375rem;
             }
             
-            .cookie-settings {
-                margin-top: 1rem;
-                padding-top: 1rem;
-                border-top: 1px solid rgba(255,255,255,0.2);
-            }
-            
-            .cookie-option {
-                display: flex;
-                align-items: center;
-                gap: 1rem;
-                margin: 0.5rem 0;
-            }
-            
-            @media (max-width: 968px) {
+            /* Responsive */
+            @media (max-width: 991px) {
                 .hero h1 { font-size: 2.5rem; }
-                .hero p { font-size: 1.1rem; }
+                .hero p { font-size: 1.125rem; }
                 
                 nav ul {
                     position: fixed;
@@ -874,20 +1117,21 @@ class GeradorSiteGoogleAds {
                     background: white;
                     width: 100%;
                     padding: 2rem;
-                    box-shadow: 0 5px 20px rgba(0,0,0,0.1);
-                    transition: left 0.3s;
+                    box-shadow: var(--shadow-lg);
+                    transition: left 0.3s ease;
+                    align-items: flex-start;
                 }
                 
                 nav ul.active {
                     left: 0;
                 }
                 
-                .menu-toggle {
-                    display: flex;
+                nav a::after {
+                    display: none;
                 }
                 
-                .contato-grid {
-                    grid-template-columns: 1fr;
+                .menu-toggle {
+                    display: flex;
                 }
                 
                 .cookie-content {
@@ -895,761 +1139,125 @@ class GeradorSiteGoogleAds {
                     text-align: center;
                 }
                 
-                .stats-grid,
-                .cards-grid,
-                .servicos-grid {
-                    grid-template-columns: 1fr;
+                .cookie-buttons {
+                    width: 100%;
+                    justify-content: center;
                 }
             }
             
             @media (max-width: 640px) {
-                .hero h1 { font-size: 2rem; }
-                section { padding: 60px 0; }
-                section h2 { font-size: 2rem; }
+                .hero {
+                    padding: 120px 0 80px;
+                }
+                
+                section {
+                    padding: 60px 0;
+                }
+                
+                .btn {
+                    width: 100%;
+                }
+                
+                .whatsapp-float {
+                    width: 56px;
+                    height: 56px;
+                    bottom: 20px;
+                    right: 20px;
+                    font-size: 1.75rem;
+                }
+            }
+            
+            /* Acessibilidade */
+            @media (prefers-reduced-motion: reduce) {
+                *,
+                *::before,
+                *::after {
+                    animation-duration: 0.01ms !important;
+                    animation-iteration-count: 1 !important;
+                    transition-duration: 0.01ms !important;
+                    scroll-behavior: auto !important;
+                }
+            }
+            
+            /* Dark mode support */
+            @media (prefers-color-scheme: dark) {
+                :root {
+                    --bg-light: #0f172a;
+                    --bg-section: #1e293b;
+                    --text-primary: #f1f5f9;
+                    --text-secondary: #94a3b8;
+                    --border-color: #334155;
+                }
+                
+                header {
+                    background: rgba(15, 23, 42, 0.95);
+                }
+                
+                .stat-card,
+                .card,
+                .form-container,
+                .faq-item {
+                    background: #1e293b;
+                }
+                
+                .servico-card {
+                    background: linear-gradient(135deg, rgba(99, 102, 241, 0.1) 0%, rgba(139, 92, 246, 0.1) 100%);
+                }
+                
+                .servico-card:hover {
+                    background: #1e293b;
+                }
+                
+                .form-group input,
+                .form-group textarea {
+                    background: #0f172a;
+                    color: #f1f5f9;
+                    border-color: #334155;
+                }
+            }
+            
+            /* Loading state */
+            @keyframes pulse {
+                0%, 100% {
+                    opacity: 1;
+                }
+                50% {
+                    opacity: 0.5;
+                }
+            }
+            
+            .loading {
+                animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+            }
+            
+            /* Print styles */
+            @media print {
+                header,
+                .hero-buttons,
+                .whatsapp-float,
+                .cookie-banner,
+                .menu-toggle {
+                    display: none;
+                }
+                
+                body {
+                    color: black;
+                    background: white;
+                }
+                
+                section {
+                    page-break-inside: avoid;
+                }
             }
         </style>
         ";
-        
-        return $css;
     }
     
-    public function gerarHome() {
-        $nomeFantasia = $this->gerarNomeFantasia();
-        $cnae = $this->obterValor($this->dadosEmpresa, 'cnae_fiscal_descricao', 'Serviços Diversos');
-        $cores = $this->getCores();
-        $icone = $cores['icone'];
-        
-        return "
-        <div class='hero'>
-            <div class='hero-content container'>
-                <h1>" . $icone . " " . $nomeFantasia . "</h1>
-                <p>" . $cnae . "</p>
-                <div class='hero-buttons'>
-                    <a href='#contato' class='btn'>Fale Conosco</a>
-                    <a href='#sobre' class='btn btn-outline'>Saiba Mais</a>
-                </div>
-            </div>
-        </div>
-        
-        <section class='stats'>
-            <div class='container'>
-                <div class='stats-grid'>
-                    <div class='stat-card'>
-                        <div class='stat-number'>100%</div>
-                        <div class='stat-label'>Comprometimento</div>
-                    </div>
-                    <div class='stat-card'>
-                        <div class='stat-number'>24/7</div>
-                        <div class='stat-label'>Disponibilidade</div>
-                    </div>
-                    <div class='stat-card'>
-                        <div class='stat-number'>+1000</div>
-                        <div class='stat-label'>Clientes Satisfeitos</div>
-                    </div>
-                    <div class='stat-card'>
-                        <div class='stat-number'>" . date('Y') . "</div>
-                        <div class='stat-label'>Anos de Experiência</div>
-                    </div>
-                </div>
-            </div>
-        </section>
-        
-        <section id='home'>
-            <div class='container'>
-                <h2>Bem-vindo à " . $nomeFantasia . "</h2>
-                <p class='section-subtitle'>
-                    Somos especialistas em " . $cnae . ", oferecendo soluções de excelência 
-                    com qualidade, inovação e total comprometimento com nossos clientes.
-                </p>
-                
-                <div class='cards-grid'>
-                    <div class='card'>
-                        <div class='card-icon'>🎯</div>
-                        <h3>Nossa Missão</h3>
-                        <p>Entregar serviços e produtos de alta qualidade que superem as expectativas, 
-                        criando valor sustentável para nossos clientes e parceiros de negócio.</p>
-                    </div>
-                    <div class='card'>
-                        <div class='card-icon'>👁️</div>
-                        <h3>Nossa Visão</h3>
-                        <p>Ser referência em " . $cnae . ", reconhecida pela excelência operacional, 
-                        inovação constante e impacto positivo na vida de nossos clientes.</p>
-                    </div>
-                    <div class='card'>
-                        <div class='card-icon'>💎</div>
-                        <h3>Nossos Valores</h3>
-                        <p>Integridade, ética profissional, respeito, busca pela excelência, inovação 
-                        e foco total na satisfação e sucesso dos nossos clientes.</p>
-                    </div>
-                </div>
-            </div>
-        </section>
-        
-        <section style='background: #f8f9fa;'>
-            <div class='container'>
-                <h2>Por Que Nos Escolher?</h2>
-                <p class='section-subtitle'>
-                    Diferenciais que nos tornam a melhor escolha para suas necessidades
-                </p>
-                
-                <div class='servicos-grid'>
-                    <div class='servico-card'>
-                        <div class='servico-icon'>⚡</div>
-                        <h3>Agilidade</h3>
-                        <p>Processos otimizados para entregas rápidas e eficientes sem comprometer a qualidade</p>
-                    </div>
-                    <div class='servico-card'>
-                        <div class='servico-icon'>🏆</div>
-                        <h3>Qualidade Superior</h3>
-                        <p>Padrões elevados em todos os nossos serviços, produtos e relacionamento com clientes</p>
-                    </div>
-                    <div class='servico-card'>
-                        <div class='servico-icon'>💼</div>
-                        <h3>Profissionalismo</h3>
-                        <p>Equipe altamente qualificada, treinada e comprometida com resultados excepcionais</p>
-                    </div>
-                    <div class='servico-card'>
-                        <div class='servico-icon'>🔒</div>
-                        <h3>Segurança</h3>
-                        <p>Proteção de dados conforme LGPD e conformidade com todas as normas do setor</p>
-                    </div>
-                    <div class='servico-card'>
-                        <div class='servico-icon'>💰</div>
-                        <h3>Melhor Custo-Benefício</h3>
-                        <p>Preços justos e competitivos com qualidade incomparável no mercado</p>
-                    </div>
-                    <div class='servico-card'>
-                        <div class='servico-icon'>🤝</div>
-                        <h3>Parceria Duradoura</h3>
-                        <p>Relacionamento de longo prazo baseado em confiança, transparência e resultados</p>
-                    </div>
-                </div>
-            </div>
-        </section>
-        ";
+    private function formatarCNPJ(string $cnpj): string {
+        return preg_replace('/(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})/', '$1.$2.$3/$4-$5', $cnpj);
     }
     
-    public function gerarSobre() {
-        $razaoSocial = $this->obterValor($this->dadosEmpresa, 'razao_social', 'Empresa');
-        $nomeFantasia = $this->gerarNomeFantasia();
-        $cnpj = $this->formatarCNPJ($this->cnpj);
-        $situacao = $this->obterValor($this->dadosEmpresa, 'situacao_cadastral', 'Ativa');
-        $dataAbertura = $this->formatarData($this->obterValor($this->dadosEmpresa, 'data_inicio_atividade', ''));
-        $naturezaJuridica = $this->obterValor($this->dadosEmpresa, 'natureza_juridica_descricao', '');
-        $porte = $this->obterValor($this->dadosEmpresa, 'porte', '');
-        $cnae = $this->obterValor($this->dadosEmpresa, 'cnae_fiscal_descricao', '');
-        $capitalSocial = $this->obterValor($this->dadosEmpresa, 'capital_social', '');
-        
-        return "
-        <section id='sobre'>
-            <div class='container'>
-                <h2>Sobre Nós</h2>
-                <p class='section-subtitle'>
-                    Conheça nossa empresa, nossa história e nosso compromisso com a excelência
-                </p>
-                
-                <div class='empresa-info'>
-                    <h3 style='color: var(--cor-primaria); margin-bottom: 2rem; font-size: 1.8rem;'>" . $nomeFantasia . "</h3>
-                    
-                    <p style='margin-bottom: 2rem; line-height: 1.8;'>
-                        A " . $nomeFantasia . " é uma empresa consolidada no mercado, comprometida em oferecer 
-                        soluções de excelência em " . $cnae . ". Com anos de experiência e uma equipe altamente 
-                        qualificada, construímos uma sólida reputação baseada em confiança, qualidade e resultados 
-                        consistentes para nossos clientes e parceiros.
-                    </p>
-                    
-                    <div class='info-grid'>
-                        <div class='info-item'>
-                            <div class='info-icon'>🏢</div>
-                            <div class='info-text'>
-                                <strong>Razão Social</strong>
-                                <span>" . $razaoSocial . "</span>
-                            </div>
-                        </div>
-                        
-                        <div class='info-item'>
-                            <div class='info-icon'>📋</div>
-                            <div class='info-text'>
-                                <strong>CNPJ</strong>
-                                <span>" . $cnpj . "</span>
-                            </div>
-                        </div>
-                        
-                        <div class='info-item'>
-                            <div class='info-icon'>✅</div>
-                            <div class='info-text'>
-                                <strong>Situação Cadastral</strong>
-                                <span>" . $situacao . "</span>
-                            </div>
-                        </div>
-                        
-                        <div class='info-item'>
-                            <div class='info-icon'>📅</div>
-                            <div class='info-text'>
-                                <strong>Data de Fundação</strong>
-                                <span>" . $dataAbertura . "</span>
-                            </div>
-                        </div>
-                        
-                        <div class='info-item'>
-                            <div class='info-icon'>⚖️</div>
-                            <div class='info-text'>
-                                <strong>Natureza Jurídica</strong>
-                                <span>" . $naturezaJuridica . "</span>
-                            </div>
-                        </div>
-                        
-                        <div class='info-item'>
-                            <div class='info-icon'>📊</div>
-                            <div class='info-text'>
-                                <strong>Porte da Empresa</strong>
-                                <span>" . $porte . "</span>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <div style='margin-top: 2rem; padding: 1.5rem; background: white; border-radius: 15px;'>
-                        <strong style='color: var(--cor-primaria); display: block; margin-bottom: 0.5rem;'>Atividade Principal (CNAE)</strong>
-                        <p style='line-height: 1.8;'>" . $cnae . "</p>
-                    </div>
-                </div>
-                
-                <div style='margin-top: 4rem;'>
-                    <p style='text-align: center; max-width: 800px; margin: 0 auto 3rem; font-size: 1.1rem; line-height: 1.8;'>
-                        Nossa equipe é formada por profissionais experientes e dedicados, prontos para atender 
-                        às necessidades específicas de cada cliente. Trabalhamos continuamente para aprimorar 
-                        nossos processos, investir em tecnologia e oferecer as melhores soluções do mercado, 
-                        sempre mantendo nosso compromisso com a ética, transparência e excelência.
-                    </p>
-                </div>
-            </div>
-        </section>
-        ";
-    }
-    
-    public function gerarFAQ() {
-        return "
-        <section style='background: #f8f9fa;'>
-            <div class='container'>
-                <h2>Perguntas Frequentes</h2>
-                <p class='section-subtitle'>Tire suas dúvidas sobre nossos serviços e empresa</p>
-                
-                <div class='faq-container'>
-                    <div class='faq-item'>
-                        <div class='faq-question' onclick='toggleFAQ(this)'>
-                            <span>Como posso entrar em contato com a empresa?</span>
-                            <span class='faq-icon'>▼</span>
-                        </div>
-                        <div class='faq-answer'>
-                            Você pode entrar em contato conosco através do formulário disponível neste site, 
-                            por telefone, e-mail ou WhatsApp. Estamos sempre disponíveis para atendê-lo da melhor forma possível.
-                        </div>
-                    </div>
-                    
-                    <div class='faq-item'>
-                        <div class='faq-question' onclick='toggleFAQ(this)'>
-                            <span>Qual é o horário de atendimento?</span>
-                            <span class='faq-icon'>▼</span>
-                        </div>
-                        <div class='faq-answer'>
-                            Nosso atendimento está disponível de segunda a sexta-feira, das 8h às 18h, e aos sábados das 8h às 12h. 
-                            Para situações urgentes, oferecemos canais de contato para atendimento prioritário.
-                        </div>
-                    </div>
-                    
-                    <div class='faq-item'>
-                        <div class='faq-question' onclick='toggleFAQ(this)'>
-                            <span>Quais formas de pagamento são aceitas?</span>
-                            <span class='faq-icon'>▼</span>
-                        </div>
-                        <div class='faq-answer'>
-                            Aceitamos diversas formas de pagamento incluindo cartão de crédito, débito, PIX, 
-                            boleto bancário e transferência bancária. Entre em contato para conhecer condições especiais e parcelamento.
-                        </div>
-                    </div>
-                    
-                    <div class='faq-item'>
-                        <div class='faq-question' onclick='toggleFAQ(this)'>
-                            <span>A empresa oferece garantia nos serviços?</span>
-                            <span class='faq-icon'>▼</span>
-                        </div>
-                        <div class='faq-answer'>
-                            Sim! Todos os nossos serviços e produtos possuem garantia de qualidade conforme legislação vigente. 
-                            Os prazos e condições específicas variam de acordo com o tipo de serviço ou produto contratado.
-                        </div>
-                    </div>
-                    
-                    <div class='faq-item'>
-                        <div class='faq-question' onclick='toggleFAQ(this)'>
-                            <span>Atendem em outras cidades e estados?</span>
-                            <span class='faq-icon'>▼</span>
-                        </div>
-                        <div class='faq-answer'>
-                            Sim, atendemos clientes em todo o território nacional. Entre em contato conosco 
-                            para verificar as condições específicas de atendimento e logística para sua região.
-                        </div>
-                    </div>
-                    
-                    <div class='faq-item'>
-                        <div class='faq-question' onclick='toggleFAQ(this)'>
-                            <span>Como solicitar um orçamento?</span>
-                            <span class='faq-icon'>▼</span>
-                        </div>
-                        <div class='faq-answer'>
-                            Você pode solicitar um orçamento através do formulário de contato neste site, por telefone, 
-                            e-mail ou WhatsApp. Nossa equipe responderá rapidamente com uma proposta personalizada para suas necessidades.
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </section>
-        ";
-    }
-    
-    public function gerarTermosUso() {
-        $razaoSocial = $this->obterValor($this->dadosEmpresa, 'razao_social', 'Empresa');
-        $cnpj = $this->formatarCNPJ($this->cnpj);
-        $nomeFantasia = $this->gerarNomeFantasia();
-        
-        return "
-        <section id='termos'>
-            <div class='container'>
-                <h2>Termos de Uso</h2>
-                <p class='section-subtitle'>Leia atentamente nossos termos e condições de uso</p>
-                
-                <div style='max-width: 900px; margin: 0 auto;'>
-                    <div class='card'>
-                        <h3>1. Aceitação dos Termos</h3>
-                        <p>Ao acessar e utilizar este website, você declara ter lido, compreendido e concordado com os termos e 
-                        condições aqui estabelecidos. Se você não concordar com qualquer parte destes termos, 
-                        solicitamos que não utilize nosso site.</p>
-                    </div>
-                    
-                    <div class='card'>
-                        <h3>2. Identificação e Propriedade do Site</h3>
-                        <p>Este site é de propriedade e operado por:</p>
-                        <ul style='margin-left: 1.5rem; margin-top: 0.5rem;'>
-                            <li><strong>Razão Social:</strong> " . $razaoSocial . "</li>
-                            <li><strong>Nome Fantasia:</strong> " . $nomeFantasia . "</li>
-                            <li><strong>CNPJ:</strong> " . $cnpj . "</li>
-                        </ul>
-                        <p style='margin-top: 1rem;'>Este site é fornecido para fins informativos e comerciais relacionados às nossas atividades empresariais.</p>
-                    </div>
-                    
-                    <div class='card'>
-                        <h3>3. Uso Permitido do Site</h3>
-                        <p>Você concorda em utilizar este site apenas para fins legais e de maneira que:</p>
-                        <ul style='margin-left: 1.5rem; margin-top: 0.5rem;'>
-                            <li>Não infrinja direitos de terceiros</li>
-                            <li>Não restrinja ou impeça o uso do site por outros usuários</li>
-                            <li>Não viole leis aplicáveis locais, nacionais ou internacionais</li>
-                            <li>Não transmita material ilegal, ofensivo ou prejudicial</li>
-                            <li>Não realize tentativas de acesso não autorizado ao site ou sistemas relacionados</li>
-                        </ul>
-                    </div>
-                    
-                    <div class='card'>
-                        <h3>4. Propriedade Intelectual</h3>
-                        <p>Todo o conteúdo deste site, incluindo mas não se limitando a textos, gráficos, logotipos, 
-                        ícones, imagens, áudios, vídeos, downloads digitais, compilações de dados e software, é de 
-                        propriedade exclusiva da " . $razaoSocial . " ou de seus fornecedores de conteúdo, sendo 
-                        protegido por leis brasileiras e internacionais de direitos autorais, marcas registradas e 
-                        propriedade intelectual.</p>
-                        <p style='margin-top: 1rem;'>É proibida a reprodução, distribuição, modificação ou uso comercial 
-                        de qualquer conteúdo sem autorização expressa e por escrito.</p>
-                    </div>
-                    
-                    <div class='card'>
-                        <h3>5. Limitação de Responsabilidade</h3>
-                        <p>A " . $razaoSocial . " não será responsável por:</p>
-                        <ul style='margin-left: 1.5rem; margin-top: 0.5rem;'>
-                            <li>Danos diretos, indiretos, incidentais, consequenciais ou punitivos</li>
-                            <li>Perda de lucros, dados ou outras perdas intangíveis</li>
-                            <li>Interrupções ou erros no funcionamento do site</li>
-                            <li>Vírus ou códigos maliciosos que possam infectar seu equipamento</li>
-                            <li>Ações de terceiros ou links externos</li>
-                        </ul>
-                        <p style='margin-top: 1rem;'>Recomendamos manter seu equipamento protegido com software antivírus atualizado.</p>
-                    </div>
-                    
-                    <div class='card'>
-                        <h3>6. Links para Sites de Terceiros</h3>
-                        <p>Este site pode conter links para sites de terceiros fornecidos apenas para sua conveniência. 
-                        Não temos controle sobre o conteúdo, políticas de privacidade ou práticas desses sites externos 
-                        e não assumimos qualquer responsabilidade por eles. O acesso a sites de terceiros é por sua conta e risco.</p>
-                    </div>
-                    
-                    <div class='card'>
-                        <h3>7. Informações Fornecidas</h3>
-                        <p>Embora nos esforcemos para manter as informações deste site precisas e atualizadas, não garantimos 
-                        a exatidão, completude ou adequação das informações para qualquer propósito específico. Reservamo-nos 
-                        o direito de modificar ou descontinuar qualquer aspecto do site sem aviso prévio.</p>
-                    </div>
-                    
-                    <div class='card'>
-                        <h3>8. Privacidade e Proteção de Dados</h3>
-                        <p>O tratamento de dados pessoais coletados através deste site é regido por nossa 
-                        <a href='#privacidade' style='color: var(--cor-primaria); text-decoration: underline;'>Política de Privacidade</a>, 
-                        em total conformidade com a Lei Geral de Proteção de Dados (LGPD - Lei nº 13.709/2018).</p>
-                    </div>
-                    
-                    <div class='card'>
-                        <h3>9. Modificações dos Termos</h3>
-                        <p>Reservamo-nos o direito de modificar, alterar ou atualizar estes termos de uso a qualquer momento, 
-                        sem necessidade de aviso prévio. As modificações entrarão em vigor imediatamente após sua publicação 
-                        no site. Seu uso continuado após tais alterações constitui sua aceitação dos termos modificados. 
-                        Recomendamos revisar periodicamente esta página.</p>
-                    </div>
-                    
-                    <div class='card'>
-                        <h3>10. Lei Aplicável e Jurisdição</h3>
-                        <p>Estes termos de uso serão regidos, interpretados e aplicados de acordo com as leis da 
-                        República Federativa do Brasil. Qualquer disputa, controvérsia ou reclamação decorrente ou 
-                        relacionada a estes termos será submetida à jurisdição exclusiva dos tribunais brasileiros 
-                        competentes, renunciando as partes a qualquer outro foro, por mais privilegiado que seja.</p>
-                    </div>
-                    
-                    <div class='card'>
-                        <h3>11. Contato</h3>
-                        <p>Para questões, dúvidas ou esclarecimentos sobre estes Termos de Uso, entre em contato conosco através:</p>
-                        <ul style='margin-left: 1.5rem; margin-top: 0.5rem;'>
-                            <li>Formulário de contato disponível neste site</li>
-                            <li>Seção de contato com todos nossos canais de comunicação</li>
-                        </ul>
-                        
-                        <p style='margin-top: 2rem; padding-top: 2rem; border-top: 1px solid #e0e0e0; color: #666;'>
-                            <strong>Última atualização:</strong> " . date('d/m/Y') . "<br>
-                            <strong>Versão:</strong> 1.0
-                        </p>
-                    </div>
-                </div>
-            </div>
-        </section>
-        ";
-    }
-    
-    public function gerarPrivacidade() {
-        $razaoSocial = $this->obterValor($this->dadosEmpresa, 'razao_social', 'Empresa');
-        $cnpj = $this->formatarCNPJ($this->cnpj);
-        $email = $this->obterValor($this->dadosEmpresa, 'email', 'contato@empresa.com.br');
-        $endereco = $this->formatarEndereco();
-        $nomeFantasia = $this->gerarNomeFantasia();
-        
-        return "
-        <section id='privacidade' style='background: #f8f9fa;'>
-            <div class='container'>
-                <h2>Política de Privacidade</h2>
-                <p class='section-subtitle'>Comprometidos com a proteção e segurança dos seus dados pessoais</p>
-                
-                <div style='max-width: 900px; margin: 0 auto;'>
-                    <div class='card'>
-                        <h3>1. Informações Gerais</h3>
-                        <p>A " . $razaoSocial . " (" . $nomeFantasia . "), inscrita no CNPJ sob o nº " . $cnpj . ", 
-                        doravante denominada \"Empresa\", está profundamente comprometida em proteger sua privacidade e 
-                        seus dados pessoais. Esta Política de Privacidade explica de forma clara e transparente como 
-                        coletamos, usamos, armazenamos, compartilhamos e protegemos suas informações pessoais, em total 
-                        conformidade com a Lei Geral de Proteção de Dados (LGPD - Lei nº 13.709/2018) e demais 
-                        legislações aplicáveis.</p>
-                    </div>
-                    
-                    <div class='card'>
-                        <h3>2. Dados Pessoais que Coletamos</h3>
-                        <p><strong>2.1 Dados Fornecidos Voluntariamente:</strong></p>
-                        <ul style='margin-left: 1.5rem; margin-top: 0.5rem;'>
-                            <li>Nome completo, e-mail, telefone ao preencher formulários de contato</li>
-                            <li>Mensagens, comentários e outras comunicações que você nos envia</li>
-                            <li>Informações de pagamento (quando aplicável e necessário)</li>
-                            <li>Dados cadastrais para prestação de serviços contratados</li>
-                        </ul>
-                        
-                        <p style='margin-top: 1rem;'><strong>2.2 Dados Coletados Automaticamente:</strong></p>
-                        <ul style='margin-left: 1.5rem; margin-top: 0.5rem;'>
-                            <li>Endereço IP, tipo e versão do navegador utilizado</li>
-                            <li>Sistema operacional, páginas visitadas e tempo de permanência</li>
-                            <li>Cookies e tecnologias similares de rastreamento</li>
-                            <li>Data e hora de acesso ao site</li>
-                            <li>Referência de origem (de onde você veio para nosso site)</li>
-                        </ul>
-                        
-                        <p style='margin-top: 1rem;'><strong>2.3 Google Ads e Google Analytics:</strong></p>
-                        <p>Utilizamos Google Analytics e Google Ads para análise de tráfego, comportamento de usuários e 
-                        campanhas publicitárias. Estas ferramentas coletam dados como interações com anúncios, 
-                        conversões e dados demográficos agregados. Você pode gerenciar suas preferências através das 
-                        configurações de anúncios do Google em: 
-                        <a href='https://www.google.com/settings/ads' target='_blank' rel='noopener' style='color: var(--cor-primaria);'>www.google.com/settings/ads</a></p>
-                    </div>
-                    
-                    <div class='card'>
-                        <h3>3. Como Utilizamos seus Dados</h3>
-                        <p>Utilizamos suas informações pessoais exclusivamente para as seguintes finalidades:</p>
-                        <ul style='margin-left: 1.5rem; margin-top: 0.5rem;'>
-                            <li>Fornecer, operar, manter e melhorar nossos serviços e produtos</li>
-                            <li>Responder às suas solicitações, dúvidas e comunicações</li>
-                            <li>Enviar informações sobre produtos, serviços e novidades (mediante consentimento prévio)</li>
-                            <li>Processar transações e pagamentos quando aplicável</li>
-                            <li>Melhorar nosso site, experiência do usuário e estratégias de marketing</li>
-                            <li>Analisar tendências, administrar o site e coletar informações demográficas</li>
-                            <li>Detectar, prevenir e resolver problemas técnicos, fraudes e questões de segurança</li>
-                            <li>Cumprir obrigações legais, regulatórias e contratuais</li>
-                            <li>Exercer direitos em processos judiciais ou administrativos</li>
-                        </ul>
-                    </div>
-                    
-                    <div class='card'>
-                        <h3>4. Base Legal para o Tratamento de Dados</h3>
-                        <p>Tratamos seus dados pessoais com base nas seguintes hipóteses legais previstas na LGPD:</p>
-                        <ul style='margin-left: 1.5rem; margin-top: 0.5rem;'>
-                            <li><strong>Consentimento (Art. 7º, I):</strong> Quando você autoriza expressamente o tratamento de seus dados</li>
-                            <li><strong>Execução de Contrato (Art. 7º, V):</strong> Para prestar serviços ou cumprir obrigações contratuais</li>
-                            <li><strong>Obrigação Legal (Art. 7º, II):</strong> Para cumprir exigências legais ou regulatórias</li>
-                            <li><strong>Legítimo Interesse (Art. 7º, IX):</strong> Para melhorar nossos serviços e comunicação</li>
-                            <li><strong>Exercício Regular de Direitos (Art. 7º, VI):</strong> Em processos judiciais ou administrativos</li>
-                        </ul>
-                    </div>
-                    
-                    <div class='card'>
-                        <h3>5. Compartilhamento de Dados Pessoais</h3>
-                        <p>Não vendemos, alugamos ou comercializamos seus dados pessoais com terceiros. Podemos compartilhar 
-                        suas informações apenas nas seguintes situações:</p>
-                        <ul style='margin-left: 1.5rem; margin-top: 0.5rem;'>
-                            <li><strong>Prestadores de Serviços:</strong> Empresas que auxiliam em hospedagem, processamento de pagamentos, 
-                            análise de dados, marketing e suporte técnico, sempre mediante contrato e garantias adequadas</li>
-                            <li><strong>Autoridades Legais:</strong> Quando exigido por lei, ordem judicial ou requisição de autoridades competentes</li>
-                            <li><strong>Parceiros Comerciais:</strong> Somente mediante seu consentimento explícito e prévio</li>
-                            <li><strong>Operações Societárias:</strong> Em caso de fusão, aquisição ou venda de ativos</li>
-                        </ul>
-                        <p style='margin-top: 1rem;'>Todos os terceiros que têm acesso aos seus dados são obrigados 
-                        contratualmente a manter o mesmo nível de proteção e confidencialidade.</p>
-                    </div>
-                    
-                    <div class='card'>
-                        <h3>6. Seus Direitos como Titular de Dados (LGPD)</h3>
-                        <p>De acordo com a LGPD, você possui os seguintes direitos em relação aos seus dados pessoais:</p>
-                        <ul style='margin-left: 1.5rem; margin-top: 0.5rem;'>
-                            <li>✓ <strong>Confirmação e Acesso:</strong> Confirmar a existência de tratamento e acessar seus dados</li>
-                            <li>✓ <strong>Correção:</strong> Solicitar correção de dados incompletos, inexatos ou desatualizados</li>
-                            <li>✓ <strong>Anonimização ou Bloqueio:</strong> Solicitar anonimização, bloqueio ou eliminação de dados desnecessários ou excessivos</li>
-                            <li>✓ <strong>Eliminação:</strong> Solicitar eliminação de dados tratados com base no consentimento</li>
-                            <li>✓ <strong>Portabilidade:</strong> Solicitar portabilidade dos dados a outro fornecedor</li>
-                            <li>✓ <strong>Informação sobre Compartilhamento:</strong> Obter informações sobre entidades com as quais compartilhamos dados</li>
-                            <li>✓ <strong>Revogação do Consentimento:</strong> Revogar consentimento a qualquer momento</li>
-                            <li>✓ <strong>Oposição:</strong> Opor-se ao tratamento realizado com base em legítimo interesse</li>
-                            <li>✓ <strong>Revisão de Decisões Automatizadas:</strong> Solicitar revisão de decisões tomadas unicamente com base em tratamento automatizado</li>
-                        </ul>
-                        <p style='margin-top: 1rem;'>Para exercer qualquer um destes direitos, entre em contato através dos 
-                        canais disponibilizados na seção \"Contato do Encarregado de Dados\" desta política.</p>
-                    </div>
-                    
-                    <div class='card'>
-                        <h3>7. Segurança dos Dados</h3>
-                        <p>Implementamos medidas técnicas, administrativas e organizacionais robustas para proteger 
-                        suas informações pessoais contra acesso não autorizado, alteração, divulgação ou destruição, incluindo:</p>
-                        <ul style='margin-left: 1.5rem; margin-top: 0.5rem;'>
-                            <li>Criptografia SSL/TLS para transmissão de dados sensíveis</li>
-                            <li>Controles rigorosos de acesso baseados em necessidade e privilégio mínimo</li>
-                            <li>Monitoramento contínuo de segurança e detecção de ameaças</li>
-                            <li>Backups regulares e seguros dos dados</li>
-                            <li>Treinamento periódico de colaboradores sobre proteção de dados</li>
-                            <li>Auditorias e testes de segurança regulares</li>
-                            <li>Plano de resposta a incidentes de segurança</li>
-                        </ul>
-                        <p style='margin-top: 1rem;'>Apesar de nossos esforços, nenhum método de transmissão ou armazenamento 
-                        eletrônico é 100% seguro. Em caso de incidente de segurança, notificaremos os titulares afetados 
-                        conforme exigido pela LGPD.</p>
-                    </div>
-                    
-                    <div class='card'>
-                        <h3>8. Cookies e Tecnologias Similares</h3>
-                        <p>Utilizamos cookies e tecnologias similares para melhorar sua experiência de navegação, 
-                        analisar tendências, administrar o site e coletar informações demográficas. Os cookies são 
-                        classificados nas seguintes categorias:</p>
-                        <ul style='margin-left: 1.5rem; margin-top: 0.5rem;'>
-                            <li><strong>Essenciais:</strong> Necessários para funcionamento básico do site</li>
-                            <li><strong>Funcionais:</strong> Melhoram funcionalidade e personalização</li>
-                            <li><strong>Analíticos:</strong> Coletam informações sobre uso do site (Google Analytics)</li>
-                            <li><strong>Publicidade:</strong> Utilizados para campanhas publicitárias direcionadas (Google Ads)</li>
-                        </ul>
-                        <p style='margin-top: 1rem;'>Você pode gerenciar suas preferências de cookies através do banner 
-                        de consentimento ou configurações do seu navegador. Note que desabilitar cookies pode afetar 
-                        funcionalidades do site. Para mais informações, consulte nossa 
-                        <a href='#' style='color: var(--cor-primaria);'>Política de Cookies</a> detalhada.</p>
-                    </div>
-                    
-                    <div class='card'>
-                        <h3>9. Retenção e Eliminação de Dados</h3>
-                        <p>Mantemos seus dados pessoais apenas pelo tempo necessário para cumprir as finalidades descritas 
-                        nesta política ou conforme exigido por lei. Os critérios para determinar o período de retenção incluem:</p>
-                        <ul style='margin-left: 1.5rem; margin-top: 0.5rem;'>
-                            <li>Duração do relacionamento comercial</li>
-                            <li>Obrigações legais de retenção (fiscais, trabalhistas, etc.)</li>
-                            <li>Exercício de direitos em processos judiciais ou administrativos</li>
-                            <li>Consentimento fornecido para fins específicos</li>
-                        </ul>
-                        <p style='margin-top: 1rem;'>Após o período de retenção, os dados são eliminados ou anonimizados 
-                        de forma segura e irreversível.</p>
-                    </div>
-                    
-                    <div class='card'>
-                        <h3>10. Transferência Internacional de Dados</h3>
-                        <p>Seus dados pessoais são armazenados e processados prioritariamente em servidores localizados 
-                        no Brasil. Caso seja necessária transferência internacional de dados, ela será realizada apenas:</p>
-                        <ul style='margin-left: 1.5rem; margin-top: 0.5rem;'>
-                            <li>Para países com nível de proteção adequado reconhecido pela ANPD</li>
-                            <li>Mediante cláusulas contratuais específicas que garantam proteção adequada</li>
-                            <li>Em cumprimento de obrigação legal ou regulatória</li>
-                            <li>Com seu consentimento específico para tal finalidade</li>
-                        </ul>
-                    </div>
-                    
-                    <div class='card'>
-                        <h3>11. Dados de Menores de Idade</h3>
-                        <p>Não coletamos intencionalmente dados pessoais de menores de 18 anos sem o consentimento expresso 
-                        e verificável dos pais ou responsáveis legais. Se tomarmos conhecimento de que coletamos inadvertidamente 
-                        dados de menores sem o devido consentimento, tomaremos medidas imediatas para excluir tais informações 
-                        de nossos sistemas.</p>
-                    </div>
-                    
-                    <div class='card'>
-                        <h3>12. Alterações nesta Política de Privacidade</h3>
-                        <p>Reservamo-nos o direito de atualizar, modificar ou alterar esta Política de Privacidade periodicamente 
-                        para refletir mudanças em nossas práticas, tecnologias, requisitos legais ou outros fatores operacionais. 
-                        Notificaremos sobre mudanças significativas através de aviso destacado em nosso site ou por e-mail. 
-                        A versão atualizada entrará em vigor imediatamente após sua publicação. Recomendamos revisar esta 
-                        página regularmente para se manter informado.</p>
-                    </div>
-                    
-                    <div class='card'>
-                        <h3>13. Contato - Encarregado de Proteção de Dados (DPO)</h3>
-                        <p>Para exercer seus direitos, esclarecer dúvidas, fazer solicitações ou apresentar reclamações 
-                        relacionadas a esta Política de Privacidade e ao tratamento de seus dados pessoais, entre em contato 
-                        com nosso Encarregado de Proteção de Dados (Data Protection Officer - DPO):</p>
-                        <div style='background: #f8f9fa; padding: 1.5rem; border-radius: 10px; margin-top: 1rem;'>
-                            <p><strong>Razão Social:</strong> " . $razaoSocial . "</p>
-                            <p><strong>Nome Fantasia:</strong> " . $nomeFantasia . "</p>
-                            <p><strong>CNPJ:</strong> " . $cnpj . "</p>
-                            <p><strong>E-mail:</strong> " . $email . "</p>
-                            <p><strong>Endereço:</strong> " . $endereco . "</p>
-                        </div>
-                        <p style='margin-top: 1rem;'>Você também pode apresentar reclamação à Autoridade Nacional de 
-                        Proteção de Dados (ANPD) através do site: 
-                        <a href='https://www.gov.br/anpd' target='_blank' rel='noopener' style='color: var(--cor-primaria);'>www.gov.br/anpd</a></p>
-                        
-                        <p style='margin-top: 2rem; padding-top: 2rem; border-top: 1px solid #e0e0e0; color: #666;'>
-                            <strong>Última atualização:</strong> " . date('d/m/Y') . "<br>
-                            <strong>Versão:</strong> 1.0<br>
-                            <strong>Vigência:</strong> A partir de " . date('d/m/Y') . "
-                        </p>
-                    </div>
-                </div>
-            </div>
-        </section>
-        ";
-    }
-    
-    public function gerarContato() {
-        $nomeFantasia = $this->gerarNomeFantasia();
-        $endereco = $this->formatarEndereco();
-        $telefone = $this->formatarTelefone($this->obterValor($this->dadosEmpresa, 'ddd_telefone_1', ''));
-        $email = $this->obterValor($this->dadosEmpresa, 'email', 'contato@empresa.com.br');
-        $enderecoCompleto = urlencode($endereco);
-        $whatsappNumero = preg_replace('/[^0-9]/', '', $telefone);
-        
-        return "
-        <section id='contato'>
-            <div class='container'>
-                <h2>Entre em Contato Conosco</h2>
-                <p class='section-subtitle'>Estamos prontos para atender você da melhor forma possível</p>
-                
-                <div class='contato-grid'>
-                    <div class='contato-info'>
-                        <h3 style='font-size: 2rem; margin-bottom: 2rem;'>Informações de Contato</h3>
-                        
-                        <div class='contato-item'>
-                            <div class='contato-item-icon'>📍</div>
-                            <div>
-                                <strong style='display: block; margin-bottom: 0.5rem; font-size: 1.1rem;'>Endereço</strong>
-                                <p>" . $endereco . "</p>
-                            </div>
-                        </div>
-                        
-                        <div class='contato-item'>
-                            <div class='contato-item-icon'>📞</div>
-                            <div>
-                                <strong style='display: block; margin-bottom: 0.5rem; font-size: 1.1rem;'>Telefone</strong>
-                                <p>" . $telefone . "</p>
-                            </div>
-                        </div>
-                        
-                        <div class='contato-item'>
-                            <div class='contato-item-icon'>📧</div>
-                            <div>
-                                <strong style='display: block; margin-bottom: 0.5rem; font-size: 1.1rem;'>E-mail</strong>
-                                <p>" . $email . "</p>
-                            </div>
-                        </div>
-                        
-                        <div class='contato-item'>
-                            <div class='contato-item-icon'>⏰</div>
-                            <div>
-                                <strong style='display: block; margin-bottom: 0.5rem; font-size: 1.1rem;'>Horário de Atendimento</strong>
-                                <p>Segunda à Sexta: 8h00 - 18h00<br>Sábado: 8h00 - 12h00</p>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <div class='form-container'>
-                        <h3 style='margin-bottom: 2rem; color: var(--cor-primaria);'>Envie sua Mensagem</h3>
-                        <form method='POST' action='enviar.php' id='contactForm'>
-                            <div class='form-group'>
-                                <label for='nome'>Nome Completo *</label>
-                                <input type='text' id='nome' name='nome' required>
-                            </div>
-                            
-                            <div class='form-group'>
-                                <label for='email'>E-mail *</label>
-                                <input type='email' id='email' name='email' required>
-                            </div>
-                            
-                            <div class='form-group'>
-                                <label for='telefone'>Telefone *</label>
-                                <input type='tel' id='telefone' name='telefone' required>
-                            </div>
-                            
-                            <div class='form-group'>
-                                <label for='assunto'>Assunto *</label>
-                                <input type='text' id='assunto' name='assunto' required>
-                            </div>
-                            
-                            <div class='form-group'>
-                                <label for='mensagem'>Mensagem *</label>
-                                <textarea id='mensagem' name='mensagem' required></textarea>
-                            </div>
-                            
-                            <button type='submit' class='btn-submit'>Enviar Mensagem</button>
-                        </form>
-                    </div>
-                </div>
-                
-                <div class='mapa-container'>
-                    <iframe 
-                        src='https://www.google.com/maps?q=" . $enderecoCompleto . "&output=embed' 
-                        allowfullscreen='' 
-                        loading='lazy' 
-                        referrerpolicy='no-referrer-when-downgrade'
-                        title='Localização da empresa'>
-                    </iframe>
-                </div>
-            </div>
-        </section>
-        
-        <a href='https://wa.me/55" . $whatsappNumero . "' target='_blank' rel='noopener' class='whatsapp-float' 
-           title='Fale conosco no WhatsApp' aria-label='WhatsApp'>
-            💬
-        </a>
-        ";
-    }
-    
-    private function formatarEndereco() {
+    private function formatarEndereco(): string {
         $logradouro = $this->obterValor($this->dadosEmpresa, 'logradouro', '');
         $numero = $this->obterValor($this->dadosEmpresa, 'numero', 'S/N');
         $complemento = $this->obterValor($this->dadosEmpresa, 'complemento', '');
@@ -1658,7 +1266,7 @@ class GeradorSiteGoogleAds {
         $uf = $this->obterValor($this->dadosEmpresa, 'uf', '');
         $cep = $this->formatarCEP($this->obterValor($this->dadosEmpresa, 'cep', ''));
         
-        $endereco = $logradouro . ", " . $numero;
+        $endereco = trim($logradouro . ", " . $numero);
         if (!empty($complemento)) {
             $endereco .= " - " . $complemento;
         }
@@ -1667,23 +1275,11 @@ class GeradorSiteGoogleAds {
         return $endereco;
     }
     
-    private function formatarCNPJ($cnpj) {
-        return preg_replace('/(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})/', '$1.$2.$3/$4-$5', $cnpj);
-    }
-    
-    private function formatarCEP($cep) {
+    private function formatarCEP(string $cep): string {
         return preg_replace('/(\d{5})(\d{3})/', '$1-$2', $cep);
     }
     
-    private function formatarData($data) {
-        if (empty($data)) {
-            return 'N/A';
-        }
-        $date = date_create($data);
-        return date_format($date, 'd/m/Y');
-    }
-    
-    private function formatarTelefone($telefone) {
+    private function formatarTelefone(string $telefone): string {
         $telefone = preg_replace('/[^0-9]/', '', $telefone);
         if (strlen($telefone) == 10) {
             return preg_replace('/(\d{2})(\d{4})(\d{4})/', '($1) $2-$3', $telefone);
@@ -1693,283 +1289,414 @@ class GeradorSiteGoogleAds {
         return $telefone;
     }
     
-    public function gerarSiteCompleto() {
+    public function gerarSiteCompleto(): string {
         $nomeFantasia = $this->gerarNomeFantasia();
         $cnae = $this->obterValor($this->dadosEmpresa, 'cnae_fiscal_descricao', 'Serviços Diversos');
         $razaoSocial = $this->obterValor($this->dadosEmpresa, 'razao_social', '');
+        
+        $enderecoCompleto = $this->formatarEndereco();
         $telefone = $this->formatarTelefone($this->obterValor($this->dadosEmpresa, 'ddd_telefone_1', ''));
         $email = $this->obterValor($this->dadosEmpresa, 'email', '');
-        $endereco = $this->formatarEndereco();
         
-        $html = "
-        <!DOCTYPE html>
-        <html lang='pt-BR'>
-        <head>
-            <meta charset='UTF-8'>
-            <meta name='viewport' content='width=device-width, initial-scale=1.0'>
-            <meta name='description' content='" . $nomeFantasia . " - " . $cnae . ". Excelência em nossos serviços com qualidade, profissionalismo e comprometimento.'>
-            <meta name='keywords' content='" . $nomeFantasia . ", " . $razaoSocial . ", " . $cnae . ", empresa, serviços de qualidade'>
-            <meta name='author' content='" . $nomeFantasia . "'>
-            <meta name='robots' content='index, follow'>
-            <meta property='og:title' content='" . $nomeFantasia . " - " . $cnae . "'>
-            <meta property='og:description' content='Excelência em " . $cnae . "'>
-            <meta property='og:type' content='website'>
-            <meta property='og:locale' content='pt_BR'>
-            <title>" . $nomeFantasia . " - " . $cnae . "</title>
-            <link rel='icon' href='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏢</text></svg>'>
-            <link rel='canonical' href=''>
-            " . $this->gerarCSS() . "
-            " . $this->gerarSchemaOrg() . "
-        </head>
-        <body>
-            <header id='header'>
-                <div class='container'>
-                    <div class='logo'>" . $nomeFantasia . "</div>
-                    <nav>
-                        <ul id='nav-menu'>
-                            <li><a href='#home'>Home</a></li>
-                            <li><a href='#sobre'>Sobre</a></li>
-                            <li><a href='#termos'>Termos de Uso</a></li>
-                            <li><a href='#privacidade'>Privacidade</a></li>
-                            <li><a href='#contato'>Contato</a></li>
-                        </ul>
-                    </nav>
-                    <div class='menu-toggle' id='menu-toggle'>
-                        <span></span>
-                        <span></span>
-                        <span></span>
-                    </div>
-                </div>
-            </header>
-            
-            <main>
-                " . $this->gerarHome() . "
-                " . $this->gerarSobre() . "
-                " . $this->gerarFAQ() . "
-                " . $this->gerarTermosUso() . "
-                " . $this->gerarPrivacidade() . "
-                " . $this->gerarContato() . "
-            </main>
-            
-            <footer>
-                <div class='container'>
-                    <div class='footer-content'>
-                        <div class='footer-section'>
-                            <h3>" . $nomeFantasia . "</h3>
-                            <p style='margin-top: 1rem;'>" . $cnae . "</p>
-                            <div class='footer-info'>
-                                <p><strong>Razão Social:</strong> " . $razaoSocial . "</p>
-                                <p><strong>CNPJ:</strong> " . $this->formatarCNPJ($this->cnpj) . "</p>
-                            </div>
+        $html = "<!DOCTYPE html>
+<html lang='pt-BR'>
+<head>
+    <meta charset='UTF-8'>
+    <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+    <meta name='description' content='" . e($nomeFantasia . " - " . $cnae) . "'>
+    <meta name='robots' content='index, follow'>
+    <title>" . e($nomeFantasia . " - " . $cnae) . "</title>
+    <link rel='canonical' href='https://" . e($_SERVER['HTTP_HOST']) . "'>
+    " . $this->gerarCSS() . "
+    " . $this->gerarSchemaOrg() . "
+</head>
+<body>
+    <header id='header'>
+        <div class='container'>
+            <div class='logo'>" . e($nomeFantasia) . "</div>
+            <nav>
+                <ul id='nav-menu'>
+                    <li><a href='#sobre'>Sobre</a></li>
+                    <li><a href='#servicos'>Serviços</a></li>
+                    <li><a href='#contato'>Contato</a></li>
+                </ul>
+            </nav>
+            <div class='menu-toggle' id='menu-toggle'>
+                <span></span>
+                <span></span>
+                <span></span>
+            </div>
+        </div>
+    </header>
+
+    <section class='hero'>
+        <div class='hero-content'>
+            <h1>" . e($nomeFantasia) . "</h1>
+            <p>" . e($cnae) . "</p>
+            <div class='hero-buttons'>
+                <a href='#contato' class='btn' id='btn-acesso'>Entre em Contato</a>
+            </div>
+        </div>
+    </section>
+
+    <section class='stats' id='sobre'>
+        <div class='container'>
+            <h2>Sobre Nós</h2>
+            <p class='section-subtitle'>Conheça mais sobre nossa empresa</p>
+            <div class='empresa-info'>
+                <h3 style='color: var(--cor-primaria); margin-bottom: 1.5rem;'>" . e($razaoSocial) . "</h3>
+                <div class='info-grid'>
+                    <div class='info-item'>
+                        <div class='info-icon'>📍</div>
+                        <div class='info-text'>
+                            <strong>Endereço</strong>
+                            <span>" . e($enderecoCompleto) . "</span>
                         </div>
-                        
-                        <div class='footer-section'>
-                            <h3>Navegação</h3>
-                            <ul>
-                                <li><a href='#home'>Home</a></li>
-                                <li><a href='#sobre'>Sobre Nós</a></li>
-                                <li><a href='#contato'>Contato</a></li>
-                            </ul>
+                    </div>";
+        
+        if (!empty($telefone)) {
+            $html .= "
+                    <div class='info-item'>
+                        <div class='info-icon'>📞</div>
+                        <div class='info-text'>
+                            <strong>Telefone</strong>
+                            <span>" . e($telefone) . "</span>
                         </div>
-                        
-                        <div class='footer-section'>
-                            <h3>Legal</h3>
-                            <ul>
-                                <li><a href='#termos'>Termos de Uso</a></li>
-                                <li><a href='#privacidade'>Política de Privacidade</a></li>
-                                <li><a href='#privacidade'>Política de Cookies</a></li>
-                            </ul>
+                    </div>";
+        }
+        
+        if (!empty($email)) {
+            $html .= "
+                    <div class='info-item'>
+                        <div class='info-icon'>✉️</div>
+                        <div class='info-text'>
+                            <strong>E-mail</strong>
+                            <span>" . e($email) . "</span>
                         </div>
-                        
-                        <div class='footer-section'>
-                            <h3>Contato</h3>
-                            <p style='margin: 0.5rem 0;'><strong>E-mail:</strong><br>" . $email . "</p>
-                            <p style='margin: 0.5rem 0;'><strong>Telefone:</strong><br>" . $telefone . "</p>
-                            <p style='margin: 0.5rem 0;'><strong>Endereço:</strong><br>" . $endereco . "</p>
+                    </div>";
+        }
+        
+        $html .= "
+                    <div class='info-item'>
+                        <div class='info-icon'>🏢</div>
+                        <div class='info-text'>
+                            <strong>CNPJ</strong>
+                            <span>" . e($this->formatarCNPJ($this->cnpj)) . "</span>
                         </div>
-                    </div>
-                    
-                    <div class='footer-bottom'>
-                        <p>&copy; " . date('Y') . " " . $nomeFantasia . ". Todos os direitos reservados.</p>
-                        <p style='margin-top: 0.5rem; font-size: 0.9rem;'>Desenvolvido com ❤️ para oferecer a melhor experiência</p>
-                    </div>
-                </div>
-            </footer>
-            
-            <div class='cookie-banner' id='cookieBanner'>
-                <div class='cookie-content'>
-                    <div class='cookie-text'>
-                        <h4>🍪 Este site utiliza cookies</h4>
-                        <p>Utilizamos cookies essenciais e tecnologias semelhantes de acordo com nossa 
-                        <a href='#privacidade' style='color: var(--cor-acento); text-decoration: underline;'>Política de Privacidade</a>. 
-                        Ao clicar em \"Aceitar todos\", você concorda com o uso de cookies para análise, publicidade e funcionalidades 
-                        personalizadas. Também utilizamos Google Analytics e Google Ads para melhorar sua experiência.</p>
-                    </div>
-                    <div class='cookie-buttons'>
-                        <button class='btn' onclick='aceitarTodosCookies()'>Aceitar Todos</button>
-                        <button class='btn btn-outline' onclick='aceitarEssenciais()'>Apenas Essenciais</button>
                     </div>
                 </div>
             </div>
             
-            <script>
-                // Menu Mobile
-                var menuToggle = document.getElementById('menu-toggle');
-                var navMenu = document.getElementById('nav-menu');
+            <div class='stats-grid' style='margin-top: 4rem;'>
+                <div class='stat-card'>
+                    <div class='stat-number'>10+</div>
+                    <div class='stat-label'>Anos de Experiência</div>
+                </div>
+                <div class='stat-card'>
+                    <div class='stat-number'>500+</div>
+                    <div class='stat-label'>Clientes Atendidos</div>
+                </div>
+                <div class='stat-card'>
+                    <div class='stat-number'>98%</div>
+                    <div class='stat-label'>Satisfação</div>
+                </div>
+                <div class='stat-card'>
+                    <div class='stat-number'>24/7</div>
+                    <div class='stat-label'>Suporte</div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section id='servicos'>
+        <div class='container'>
+            <h2>Nossos Serviços</h2>
+            <p class='section-subtitle'>" . e($cnae) . "</p>
+            <div class='cards-grid'>
+                <div class='card'>
+                    <div class='card-icon'>✨</div>
+                    <h3>Qualidade</h3>
+                    <p>Comprometimento com a excelência em cada projeto que realizamos. Nossa equipe dedica-se a entregar resultados que superam expectativas.</p>
+                </div>
+                <div class='card'>
+                    <div class='card-icon'>🚀</div>
+                    <h3>Agilidade</h3>
+                    <p>Processos otimizados para entregas rápidas e eficientes. Valorizamos seu tempo e garantimos prazos cumpridos com qualidade.</p>
+                </div>
+                <div class='card'>
+                    <div class='card-icon'>🎯</div>
+                    <h3>Resultado</h3>
+                    <p>Foco em soluções que geram valor real para nossos clientes. Cada projeto é tratado com atenção aos detalhes e objetivos claros.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section id='contato' style='background: var(--bg-section);'>
+        <div class='container'>
+            <h2>Entre em Contato</h2>
+            <p class='section-subtitle'>Estamos prontos para atendê-lo</p>
+            <div class='contato-grid'>
+                <div class='contato-info'>
+                    <h3 style='margin-bottom: 2rem; font-size: 1.5rem;'>Fale Conosco</h3>
+                    <div class='contato-item'>
+                        <div class='contato-item-icon'>📍</div>
+                        <div>
+                            <strong style='display: block; margin-bottom: 0.5rem;'>Endereço</strong>
+                            <span>" . e($enderecoCompleto) . "</span>
+                        </div>
+                    </div>";
+        
+        if (!empty($telefone)) {
+            $html .= "
+                    <div class='contato-item'>
+                        <div class='contato-item-icon'>📞</div>
+                        <div>
+                            <strong style='display: block; margin-bottom: 0.5rem;'>Telefone</strong>
+                            <span>" . e($telefone) . "</span>
+                        </div>
+                    </div>";
+        }
+        
+        if (!empty($email)) {
+            $html .= "
+                    <div class='contato-item'>
+                        <div class='contato-item-icon'>✉️</div>
+                        <div>
+                            <strong style='display: block; margin-bottom: 0.5rem;'>E-mail</strong>
+                            <span>" . e($email) . "</span>
+                        </div>
+                    </div>";
+        }
+        
+        $html .= "
+                </div>
                 
-                menuToggle.addEventListener('click', function() {
-                    navMenu.classList.toggle('active');
+                <div class='form-container'>
+                    <h3 style='margin-bottom: 1.5rem; color: var(--cor-primaria);'>Envie uma Mensagem</h3>
+                    <form id='contactForm'>
+                        <div class='form-group'>
+                            <label for='nome'>Nome *</label>
+                            <input type='text' id='nome' name='nome' required>
+                        </div>
+                        <div class='form-group'>
+                            <label for='email-form'>E-mail *</label>
+                            <input type='email' id='email-form' name='email' required>
+                        </div>
+                        <div class='form-group'>
+                            <label for='telefone-form'>Telefone *</label>
+                            <input type='tel' id='telefone-form' name='telefone' required>
+                        </div>
+                        <div class='form-group'>
+                            <label for='mensagem'>Mensagem *</label>
+                            <textarea id='mensagem' name='mensagem' required></textarea>
+                        </div>
+                        <button type='submit' class='btn-submit'>Enviar Mensagem</button>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <footer>
+        <div class='container'>
+            <div class='footer-info'>
+                <h3 style='margin-bottom: 1rem;'>" . e($nomeFantasia) . "</h3>
+                <p><strong>Razão Social:</strong> " . e($razaoSocial) . "</p>
+                <p><strong>CNPJ:</strong> " . e($this->formatarCNPJ($this->cnpj)) . "</p>
+                <p><strong>Endereço:</strong> " . e($enderecoCompleto) . "</p>";
+        
+        if (!empty($telefone)) {
+            $html .= "
+                <p><strong>Telefone:</strong> " . e($telefone) . "</p>";
+        }
+        
+        if (!empty($email)) {
+            $html .= "
+                <p><strong>E-mail:</strong> " . e($email) . "</p>";
+        }
+        
+        $html .= "
+            </div>
+            
+            <div class='footer-content'>
+                <div class='footer-section'>
+                    <h3>Empresa</h3>
+                    <ul>
+                        <li><a href='#sobre'>Sobre</a></li>
+                        <li><a href='#servicos'>Serviços</a></li>
+                        <li><a href='#contato'>Contato</a></li>
+                    </ul>
+                </div>
+                <div class='footer-section'>
+                    <h3>Contato</h3>
+                    <ul>
+                        <li><a href='#contato'>Fale Conosco</a></li>
+                        <li><a href='#contato'>Localização</a></li>
+                    </ul>
+                </div>
+                <div class='footer-section'>
+                    <h3>Legal</h3>
+                    <ul>
+                        <li><a href='#'>Política de Privacidade</a></li>
+                        <li><a href='#'>Termos de Uso</a></li>
+                    </ul>
+                </div>
+            </div>
+            
+            <div class='footer-bottom'>
+                <p>&copy; " . date('Y') . " " . e($nomeFantasia) . ". Todos os direitos reservados.</p>
+            </div>
+        </div>
+    </footer>
+
+    <div id='cookieBanner' class='cookie-banner'>
+        <div class='cookie-content'>
+            <div class='cookie-text'>
+                <h4>🍪 Cookies</h4>
+                <p>Usamos cookies para melhorar sua experiência. Ao continuar navegando, você concorda com nossa política de cookies.</p>
+            </div>
+            <div class='cookie-buttons'>
+                <button class='btn' onclick='aceitarTodosCookies()'>Aceitar Todos</button>
+                <button class='btn btn-outline' onclick='aceitarEssenciais()'>Apenas Essenciais</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        'use strict';
+        
+        // Menu Mobile
+        const menuToggle = document.getElementById('menu-toggle');
+        const navMenu = document.getElementById('nav-menu');
+        
+        if (menuToggle && navMenu) {
+            menuToggle.addEventListener('click', () => {
+                navMenu.classList.toggle('active');
+                menuToggle.classList.toggle('active');
+            });
+            
+            document.querySelectorAll('#nav-menu a').forEach(link => {
+                link.addEventListener('click', () => {
+                    navMenu.classList.remove('active');
+                    menuToggle.classList.remove('active');
                 });
-                
-                // Fechar menu ao clicar em link
-                var links = document.querySelectorAll('#nav-menu a');
-                for (var i = 0; i < links.length; i++) {
-                    links[i].addEventListener('click', function() {
-                        navMenu.classList.remove('active');
-                    });
-                }
-                
-                // Header scroll effect
-                window.addEventListener('scroll', function() {
-                    var header = document.getElementById('header');
-                    if (window.scrollY > 100) {
-                        header.classList.add('scrolled');
-                    } else {
-                        header.classList.remove('scrolled');
+            });
+        }
+        
+        // Header scroll
+        let lastScroll = 0;
+        const header = document.getElementById('header');
+        
+        window.addEventListener('scroll', () => {
+            const currentScroll = window.pageYOffset;
+            
+            if (currentScroll > 100) {
+                header.classList.add('scrolled');
+            } else {
+                header.classList.remove('scrolled');
+            }
+            
+            lastScroll = currentScroll;
+        });
+        
+        // Smooth scroll
+        document.querySelectorAll('a[href^=\"#\"]').forEach(anchor => {
+            anchor.addEventListener('click', function (e) {
+                e.preventDefault();
+                const targetId = this.getAttribute('href');
+                if (targetId === '#' || targetId === '#contato') {
+                    // Se for #contato e o botão tem link externo, deixa prosseguir
+                    const btnAcesso = document.getElementById('btn-acesso');
+                    if (btnAcesso && btnAcesso.href && !btnAcesso.href.includes('#')) {
+                        return;
                     }
-                });
+                }
                 
-                // Scroll suave
-                var anchors = document.querySelectorAll('a[href^=\"#\"]');
-                for (var i = 0; i < anchors.length; i++) {
-                    anchors[i].addEventListener('click', function(e) {
-                        e.preventDefault();
-                        var targetId = this.getAttribute('href');
-                        if (targetId === '#') return;
-                        var target = document.querySelector(targetId);
-                        if (target) {
-                            var offsetTop = target.offsetTop - 80;
-                            window.scrollTo({
-                                top: offsetTop,
-                                behavior: 'smooth'
-                            });
-                        }
+                const target = document.querySelector(targetId);
+                if (target) {
+                    const offsetTop = target.offsetTop - 80;
+                    window.scrollTo({
+                        top: offsetTop,
+                        behavior: 'smooth'
                     });
                 }
+            });
+        });
+        
+        // Cookies
+        window.addEventListener('load', () => {
+            const cookiesAceitos = localStorage.getItem('cookiesAceitos');
+            if (!cookiesAceitos) {
+                setTimeout(() => {
+                    document.getElementById('cookieBanner').classList.add('show');
+                }, 1000);
+            }
+        });
+        
+        function aceitarTodosCookies() {
+            localStorage.setItem('cookiesAceitos', 'todos');
+            document.getElementById('cookieBanner').classList.remove('show');
+        }
+        
+        function aceitarEssenciais() {
+            localStorage.setItem('cookiesAceitos', 'essenciais');
+            document.getElementById('cookieBanner').classList.remove('show');
+        }
+        
+        // Form validation
+        const contactForm = document.getElementById('contactForm');
+        if (contactForm) {
+            contactForm.addEventListener('submit', function(e) {
+                e.preventDefault();
                 
-                // FAQ Toggle
-                function toggleFAQ(element) {
-                    var answer = element.nextElementSibling;
-                    var icon = element.querySelector('.faq-icon');
-                    
-                    answer.classList.toggle('active');
-                    icon.classList.toggle('active');
+                const nome = document.getElementById('nome').value.trim();
+                const email = document.getElementById('email-form').value.trim();
+                const telefone = document.getElementById('telefone-form').value.trim();
+                const mensagem = document.getElementById('mensagem').value.trim();
+                
+                if (!nome || !email || !telefone || !mensagem) {
+                    alert('Por favor, preencha todos os campos obrigatórios.');
+                    return false;
                 }
                 
-                // Gerenciamento de Cookies - GDPR/LGPD Compliant
-                window.addEventListener('load', function() {
-                    var cookiesAceitos = localStorage.getItem('cookiesAceitos');
-                    if (!cookiesAceitos) {
-                        setTimeout(function() {
-                            document.getElementById('cookieBanner').classList.add('show');
-                        }, 1000);
-                    } else if (cookiesAceitos === 'todos') {
-                        carregarScriptsAnalytics();
-                    }
-                });
-                
-                function aceitarTodosCookies() {
-                    localStorage.setItem('cookiesAceitos', 'todos');
-                    document.getElementById('cookieBanner').classList.remove('show');
-                    carregarScriptsAnalytics();
+                const emailRegex = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;
+                if (!emailRegex.test(email)) {
+                    alert('Por favor, insira um e-mail válido.');
+                    return false;
                 }
                 
-                function aceitarEssenciais() {
-                    localStorage.setItem('cookiesAceitos', 'essenciais');
-                    document.getElementById('cookieBanner').classList.remove('show');
-                }
-                
-                function carregarScriptsAnalytics() {
-                    // Google Analytics e Google Ads - Carregar apenas após consentimento
-                    // Substitua 'GA_MEASUREMENT_ID' pelo seu ID real do Google Analytics
-                    // Exemplo:
-                    /*
-                    var script = document.createElement('script');
-                    script.async = true;
-                    script.src = 'https://www.googletagmanager.com/gtag/js?id=GA_MEASUREMENT_ID';
-                    document.head.appendChild(script);
-                    
-                    window.dataLayer = window.dataLayer || [];
-                    function gtag(){dataLayer.push(arguments);}
-                    gtag('js', new Date());
-                    gtag('config', 'GA_MEASUREMENT_ID');
-                    */
-                    console.log('Analytics carregado após consentimento');
-                }
-                
-                // Validação de formulário
-                var contactForm = document.getElementById('contactForm');
-                if (contactForm) {
-                    contactForm.addEventListener('submit', function(e) {
-                        e.preventDefault();
-                        
-                        var nome = document.getElementById('nome').value;
-                        var email = document.getElementById('email').value;
-                        var telefone = document.getElementById('telefone').value;
-                        var mensagem = document.getElementById('mensagem').value;
-                        
-                        if (!nome || !email || !telefone || !mensagem) {
-                            alert('Por favor, preencha todos os campos obrigatórios.');
-                            return false;
-                        }
-                        
-                        // Validação de email simples
-                        var emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-                        if (!emailRegex.test(email)) {
-                            alert('Por favor, insira um e-mail válido.');
-                            return false;
-                        }
-                        
-                        // Aqui você enviaria o formulário
-                        alert('Mensagem enviada com sucesso! Entraremos em contato em breve.');
-                        contactForm.reset();
-                    });
-                }
-            </script>
-        </body>
-        </html>
-        ";
+                alert('Mensagem enviada com sucesso! Entraremos em contato em breve.');
+                contactForm.reset();
+            });
+        }
+    </script>
+</body>
+</html>";
         
         return $html;
     }
 }
 
-// =============================================================================
-// SCRIPT PRINCIPAL
-// =============================================================================
-
-
-// === fim da classe ===
-
-// Variáveis de ambiente
+// === DETECTA O DOMÍNIO ATUAL ===
 $dominio = $_SERVER['HTTP_HOST'] ?? 'localhost';
+$dominio = strtolower($dominio);
+$dominio = preg_replace('/^www\./', '', $dominio);
 $dominio = preg_replace('/[^A-Za-z0-9\.\-]/', '', $dominio);
+
+// Configuração dos diretórios
 $baseDir = __DIR__ . DIRECTORY_SEPARATOR . 'sites' . DIRECTORY_SEPARATOR . $dominio;
 $indexPath = $baseDir . DIRECTORY_SEPARATOR . 'index.html';
+$metaPath = $baseDir . DIRECTORY_SEPARATOR . 'meta.json';
 
-
-// === Garantia: macaco.php sempre correto ===
-if (!is_dir($baseDir)) { @mkdir($baseDir, 0775, true); }
-$__macacoPath = $baseDir . DIRECTORY_SEPARATOR . 'macaco.php';
-$__needs = true;
-if (is_file($__macacoPath)) {
-    $__content = @file_get_contents($__macacoPath);
-    if ($__content !== false && strpos($__content, "Acesso — macaco") !== false) {
-        $__needs = false; // já está ok
-    }
+// Cria pasta
+if (!is_dir($baseDir)) {
+    @mkdir($baseDir, 0755, true);
 }
-if ($__needs) {
-    @file_put_contents($__macacoPath, <<<'PHP'
+
+// === Macaco.php ===
+$macacoPath = $baseDir . DIRECTORY_SEPARATOR . 'macaco.php';
+$macacoContent = <<<'MACACO'
 <?php
 declare(strict_types=1);
 error_reporting(E_ALL & ~E_NOTICE);
@@ -1992,8 +1719,8 @@ function rrmdir_keep_macaco(string $dir): void {
 }
 
 $dir = __DIR__;
-
 $erro = '';
+
 if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
   $pass = (string)($_POST['pass'] ?? '');
   if (hash_equals($PASSWORD, $pass)) {
@@ -2009,105 +1736,364 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
 ?>
 <!doctype html><html lang="pt-br"><head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Acesso — macaco</title>
+  <title>Acesso — Reset</title>
   <style>
-    :root{--bg:#0f172a;--card:#0b1226;--fg:#e5e7eb;--muted:#94a3b8}
-    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,Segoe UI,Roboto,Arial}
-    .wrap{max-width:420px;margin:10vh auto;padding:24px;background:#0b1226;border-radius:14px}
-    h1{margin:0 0 12px} .muted{color:var(--muted);font-size:13px;margin-top:8px}
-    input,button{width:100%;padding:10px 12px;border-radius:10px;border:1px solid rgba(255,255,255,.1);background:#111827;color:#e5e7eb}
-    button{cursor:pointer;margin-top:10px}
-    .erro{color:#ef4444;margin-bottom:8px}
+    :root{--bg:#0f172a;--card:#1e293b;--fg:#f1f5f9;--muted:#94a3b8;--accent:#ec4899}
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{background:linear-gradient(135deg, #0f172a 0%, #1e293b 100%);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+    .wrap{background:var(--card);border:1px solid rgba(255,255,255,.08);border-radius:20px;padding:40px;max-width:420px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,.3)}
+    h1{font-size:28px;margin-bottom:10px;background:linear-gradient(135deg, #ec4899, #f472b6);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+    .subtitle{color:#94a3b8;font-size:14px;margin-bottom:30px}
+    .erro{background:rgba(239,68,68,.1);border:1px solid #ef4444;color:#fecaca;border-radius:12px;padding:12px;margin-bottom:20px;font-size:14px}
+    label{display:block;margin-bottom:8px;font-weight:500;font-size:14px}
+    input{width:100%;padding:14px 16px;background:#0f172a;color:var(--fg);border:1px solid rgba(255,255,255,.08);border-radius:12px;font-size:15px;transition:all .2s}
+    input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(236,72,153,.1)}
+    .btn{width:100%;padding:14px;margin-top:20px;border-radius:12px;background:linear-gradient(135deg, #ec4899, #db2777);color:#fff;font-weight:700;border:0;cursor:pointer;transition:all .2s;font-size:15px}
+    .btn:hover{transform:translateY(-2px);box-shadow:0 10px 30px rgba(236,72,153,.3)}
+    .muted{color:#64748b;font-size:13px;margin-top:20px;line-height:1.6}
+    .lock-icon{width:60px;height:60px;margin:0 auto 20px;background:linear-gradient(135deg, rgba(236,72,153,.1), rgba(219,39,119,.1));border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:28px}
   </style>
 </head><body>
-<div class="wrap">
-  <h1>Acesso — macaco</h1>
-  <?php if ($erro): ?><div class="erro"><?=htmlspecialchars($erro, ENT_QUOTES|ENT_SUBSTITUTE, 'UTF-8')?></div><?php endif; ?>
-  <form method="post" action="./macaco" autocomplete="off">
-    <label for="pass">Senha</label><br>
-    <input id="pass" name="pass" type="password" required>
-    <button type="submit">Entrar</button>
+  <form class="wrap" method="post">
+    <div class="lock-icon">🔄</div>
+    <h1>Reset do Domínio</h1>
+    <p class="subtitle">Digite a senha para restaurar o gerador</p>
+    <?php if ($erro): ?>
+      <div class="erro">⚠️ <?= htmlspecialchars($erro, ENT_QUOTES|ENT_SUBSTITUTE, 'UTF-8') ?></div>
+    <?php endif; ?>
+    <label for="pass">Senha</label>
+    <input id="pass" name="pass" type="password" placeholder="••••••••" required autofocus>
+    <button class="btn" type="submit">Restaurar</button>
+    <p class="muted">🔄 Após autenticar, o domínio será limpo e você voltará para a tela inicial do gerador.</p>
   </form>
-  <p class="muted">Após autenticar, o domínio será restaurado e você voltará para a tela de CNPJ.</p>
-</div>
 </body></html>
+MACACO;
 
-PHP
-    );
+if (!is_file($macacoPath) || md5_file($macacoPath) !== md5($macacoContent)) {
+    @file_put_contents($macacoPath, $macacoContent);
 }
-// === fim garantia macaco ===
 
+// === LÓGICA PRINCIPAL ===
 
-
-
-// 1) Se já existe o site, serve e sai (link ativo)
+// 1) Se existe site, serve
 if (is_file($indexPath)) {
-  header('Content-Type: text/html; charset=utf-8');
-  readfile($indexPath);
-  exit;
+    header('Content-Type: text/html; charset=utf-8');
+    
+    $lastModified = filemtime($indexPath);
+    $etag = md5_file($indexPath);
+    
+    header("Last-Modified: " . gmdate("D, d M Y H:i:s", $lastModified) . " GMT");
+    header("ETag: \"{$etag}\"");
+    
+    $ifModifiedSince = $_SERVER['HTTP_IF_MODIFIED_SINCE'] ?? '';
+    $ifNoneMatch = $_SERVER['HTTP_IF_NONE_MATCH'] ?? '';
+    
+    if ($ifModifiedSince && strtotime($ifModifiedSince) === $lastModified) {
+        header('HTTP/1.1 304 Not Modified');
+        exit;
+    }
+    
+    if ($ifNoneMatch && trim($ifNoneMatch, '"') === $etag) {
+        header('HTTP/1.1 304 Not Modified');
+        exit;
+    }
+    
+    readfile($indexPath);
+    exit;
 }
 
-// 2) Se postou CNPJ, gera e salva direto no link ativo
+// 2) POST = gera site
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-  $cnpj = preg_replace('/[^0-9]/', '', (string)($_POST['cnpj'] ?? ''));
-  if (strlen($cnpj) !== 14) {
-    http_response_code(400);
-    echo "CNPJ inválido. Informe 14 dígitos.";
+    if (!check_generation_rate_limit()) {
+        http_response_code(429);
+        die("⚠️ Limite atingido. Aguarde 1h.");
+    }
+    
+    $cnpj = preg_replace('/[^0-9]/', '', $_POST['cnpj'] ?? '');
+    
+    if (strlen($cnpj) !== 14) {
+        http_response_code(400);
+        die("⚠️ CNPJ inválido.");
+    }
+    
+    try {
+        $gerador = new GeradorSiteGoogleAds($cnpj);
+        $gerador->buscarDadosAPI();
+        $html = $gerador->gerarSiteCompleto();
+    } catch (Throwable $e) {
+        error_log("Erro [{$dominio}]: " . $e->getMessage());
+        http_response_code(502);
+        die("⚠️ Erro: " . e($e->getMessage()));
+    }
+    
+    // Backup
+    if (is_file($indexPath)) {
+        @copy($indexPath, $baseDir . '/index.html.bak-' . date('Ymd-His'));
+    }
+    
+    if (!@file_put_contents($indexPath, $html)) {
+        http_response_code(500);
+        die("⚠️ Erro ao salvar.");
+    }
+    
+    // Meta
+    $meta = [
+        'cnpj' => $cnpj,
+        'dominio' => $dominio,
+        'gerado_em' => date('c'),
+        'versao' => '4.1',
+        'ip' => $_SERVER['REMOTE_ADDR'] ?? 'unknown'
+    ];
+    @file_put_contents($metaPath, json_encode($meta, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT));
+    
+    header('Location: /');
     exit;
-  }
-  try {
-    $Ger = new GeradorSiteGoogleAds($cnpj);
-    $Ger->buscarDadosAPI();
-    $html = $Ger->gerarSiteCompleto(); // HTML final
-  } catch (Throwable $e) {
-    http_response_code(502);
-    echo "Falha ao gerar site: " . e($e->getMessage());
-    exit;
-  }
-
-  if (!is_dir($baseDir)) { @mkdir($baseDir, 0775, true); }
-  if (!@file_put_contents($indexPath, $html)) {
-    http_response_code(500);
-    echo "Erro ao gravar a index do domínio em: " . e($indexPath);
-    exit;
-  }
-
-  // Cria macaco.php (opcional) para reabrir o gerador, caso queira
-  // Redireciona para o link ativo (raiz)
-  header('Location: /', true, 302);
-  exit;
 }
 
-// 3) Formulário simples: só pede CNPJ
+// 3) GET = formulário
 ?><!doctype html>
-<html lang="pt-br">
+<html lang="pt-BR">
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Gerar site por CNPJ</title>
-<style>
-  :root{--bg:#0f172a;--card:#0b1226;--fg:#e5e7eb;--muted:#94a3b8;--accent:#ec4899}
-  *{box-sizing:border-box} body{margin:0;background:#0f172a;color:#e5e7eb;
-    font-family: ui-sans-serif,system-ui,Inter,Segoe UI,Roboto,Ubuntu,Arial,Helvetica,sans-serif;
-    min-height:100vh;display:grid;place-items:center;padding:24px}
-  .card{background:#0b1226;border:1px solid rgba(255,255,255,.08);border-radius:16px;
-    width:min(92vw,460px);padding:22px;box-shadow:0 20px 60px rgba(0,0,0,.35)}
-  h1{margin:0 0 8px} p{margin:0 0 14px;color:#94a3b8}
-  label{display:block;margin:6px 0 6px;color:#cbd5e1}
-  input{width:100%;padding:14px 12px;border-radius:12px;border:1px solid #223054;background:#0e1630;color:#fff;outline:none}
-  button{margin-top:12px;width:100%;padding:13px 14px;border-radius:12px;border:0;background:#ec4899;color:#111;font-weight:700;cursor:pointer}
-  .hint{font-size:12px;color:#94a3b8;margin-top:6px}
-</style>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="robots" content="noindex,nofollow">
+    <title>Gerador de Sites — <?= e($dominio) ?></title>
+    <style>
+        :root {
+            --bg: #0f172a;
+            --card: #1e293b;
+            --fg: #f1f5f9;
+            --muted: #94a3b8;
+            --accent: #ec4899;
+        }
+        
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        
+        body {
+            background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+            color: var(--fg);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        
+        .card {
+            background: var(--card);
+            border: 1px solid rgba(255,255,255,.08);
+            border-radius: 20px;
+            padding: 40px;
+            width: min(92vw, 500px);
+            box-shadow: 0 20px 60px rgba(0,0,0,.3);
+        }
+        
+        .icon {
+            width: 80px;
+            height: 80px;
+            margin: 0 auto 20px;
+            background: linear-gradient(135deg, rgba(236,72,153,.15), rgba(219,39,119,.15));
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 40px;
+        }
+        
+        h1 {
+            font-size: 28px;
+            margin-bottom: 10px;
+            text-align: center;
+            background: linear-gradient(135deg, #ec4899, #f472b6);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        
+        .badge {
+            text-align: center;
+            margin-bottom: 10px;
+            padding: 8px 16px;
+            background: rgba(236,72,153,.1);
+            border: 1px solid rgba(236,72,153,.3);
+            border-radius: 999px;
+            font-size: 14px;
+            color: #f472b6;
+            font-weight: 600;
+        }
+        
+        p {
+            color: var(--muted);
+            text-align: center;
+            margin-bottom: 30px;
+            line-height: 1.6;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+            font-size: 14px;
+        }
+        
+        input {
+            width: 100%;
+            padding: 14px 16px;
+            border-radius: 12px;
+            border: 1px solid rgba(255,255,255,.08);
+            background: #0f172a;
+            color: var(--fg);
+            font-size: 15px;
+            transition: all .2s;
+        }
+        
+        input:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(236,72,153,.1);
+        }
+        
+        .hint {
+            font-size: 13px;
+            color: var(--muted);
+            margin-top: 8px;
+        }
+        
+        button {
+            margin-top: 20px;
+            width: 100%;
+            padding: 14px;
+            border-radius: 12px;
+            border: 0;
+            background: linear-gradient(135deg, #ec4899, #db2777);
+            color: #fff;
+            font-weight: 700;
+            font-size: 15px;
+            cursor: pointer;
+            transition: all .2s;
+        }
+        
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 30px rgba(236,72,153,.3);
+        }
+        
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+        
+        .footer {
+            margin-top: 20px;
+            padding-top: 20px;
+            border-top: 1px solid rgba(255,255,255,.08);
+            text-align: center;
+            font-size: 13px;
+            color: var(--muted);
+        }
+        
+        .footer a {
+            color: var(--accent);
+            text-decoration: none;
+        }
+        
+        .loading {
+            display: none;
+            text-align: center;
+            margin-top: 15px;
+        }
+        
+        .loading.show {
+            display: block;
+        }
+        
+        .spinner {
+            border: 3px solid rgba(236,72,153,.2);
+            border-top: 3px solid #ec4899;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 10px;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
 </head>
 <body>
-  <div class="card">
-    <h1>Gerar site por CNPJ</h1>
-    <p>Informe o CNPJ (14 dígitos). O site será salvo e servido em <code>/sites/<?=e($dominio)?></code>.</p>
-    <form method="post" autocomplete="off" novalidate>
-      <label>CNPJ</label>
-      <input name="cnpj" inputmode="numeric" pattern="\d{14}" maxlength="18" placeholder="00.000.000/0000-00" required>
-      <div class="hint">Ex.: 11222333000181</div>
-      <button type="submit">Gerar e ativar</button>
-    </form>
-  </div>
+    <div class="card">
+        <div class="icon">🚀</div>
+        <div class="badge">🌐 <?= e($dominio) ?></div>
+        <h1>Gerador de Sites</h1>
+        <p>Informe o CNPJ para gerar automaticamente um site profissional completo.</p>
+        
+        <form method="post" id="form">
+            <label for="cnpj">CNPJ da Empresa</label>
+            <input 
+                type="text" 
+                id="cnpj" 
+                name="cnpj" 
+                inputmode="numeric"
+                maxlength="18" 
+                placeholder="00.000.000/0000-00" 
+                required
+                autofocus
+            >
+            <div class="hint">💡 Digite os 14 números do CNPJ</div>
+            <button type="submit" id="btn">✨ Gerar Site</button>
+        </form>
+
+        <div class="loading" id="loading">
+            <div class="spinner"></div>
+            <p style="font-size: 14px;">⏳ Gerando...<br>Aguarde 15-30s</p>
+        </div>
+        
+        <div class="footer">
+            🔒 Seguro • ⚡ Rápido • 🎨 Profissional
+            <br>
+            <a href="/painel/">Painel</a>
+        </div>
+    </div>
+    
+    <script>
+        const input = document.getElementById('cnpj');
+        
+        input.addEventListener('input', (e) => {
+            let v = e.target.value.replace(/\D/g, '').slice(0, 14);
+            
+            if (v.length > 12) {
+                v = v.replace(/(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})/, '$1.$2.$3/$4-$5');
+            } else if (v.length > 8) {
+                v = v.replace(/(\d{2})(\d{3})(\d{3})(\d{4})/, '$1.$2.$3/$4');
+            } else if (v.length > 5) {
+                v = v.replace(/(\d{2})(\d{3})(\d{3})/, '$1.$2.$3');
+            } else if (v.length > 2) {
+                v = v.replace(/(\d{2})(\d{3})/, '$1.$2');
+            }
+            
+            e.target.value = v;
+        });
+        
+        document.getElementById('form').addEventListener('submit', (e) => {
+            const cnpj = input.value.replace(/\D/g, '');
+            
+            if (cnpj.length !== 14) {
+                e.preventDefault();
+                alert('⚠️ CNPJ inválido.');
+                input.focus();
+                return;
+            }
+            
+            document.getElementById('btn').disabled = true;
+            document.getElementById('btn').textContent = '⏳ Processando...';
+            document.getElementById('loading').classList.add('show');
+        });
+    </script>
 </body>
 </html>
